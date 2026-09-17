@@ -1,3 +1,6 @@
+import {createAbuseGuard} from './abuse-http.ts';
+import type {AuthChallenge} from './challenge.ts';
+import {createManualRecoveryFlows} from './manual-recovery.ts';
 import {createFactorRecoveryFlows} from './factor-recovery.ts';
 import type {FactorRecoveryMessage} from './factor-recovery.ts';
 import { createPresentation } from './presentation.ts';
@@ -15,6 +18,7 @@ import type { AuthService, AuthPrincipal, AuthUser } from './auth-core.ts';
 import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, httpFailure, jsonResponse, pageResponse as renderPage, readFields, wantsJson, passkeyScript, secondFactorButton } from './auth-ui.ts';
 import type { AuthHttpResponse } from './auth-ui.ts';
 export interface AuthExtensionOptions {
+    challenge?:AuthChallenge;
     sendFactorRecovery?:(message:FactorRecoveryMessage)=>Promise<void>;
     presentation?: Presentation;
     service: AuthService;
@@ -22,22 +26,25 @@ export interface AuthExtensionOptions {
     projectSha256: string;
     providers?: Record<string, OidcProvider>;
     passkeys?: PasskeyProvider;
-    sendSignupCode?: (message: { email: string; code: string; signal: AbortSignal }) => Promise<void>;
+    sendSignupCode?: (message: { email: string; code: string; locale?: string; signal: AbortSignal }) => Promise<void>;
     sendEmailCode?: (message: {
         email: string;
         flowId: string;
         code: string;
+        locale?: string;
         signal: AbortSignal;
     }) => Promise<void>;
     sendNotice?: (message: {
         email: string;
-        event: 'password-changed' | 'new-device' | 'registration-attempt';
+        event: 'password-changed' | 'new-device' | 'registration-attempt' | 'email-changed';
+        locale?: string;
         signal: AbortSignal;
     }) => Promise<void>;
     sendToken?: (message: {
         email: string;
         token: string;
         purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change';
+        locale?: string;
         signal: AbortSignal;
     }) => Promise<void>;
 }
@@ -84,15 +91,18 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                 return { ...(fields.displayName !== undefined ? { displayName: fields.displayName } : {}), ...(fields.locale ? { locale: fields.locale } : {}), ...(Object.keys(metadata).length ? { metadata } : {}), ...(fields.termsAccepted !== undefined ? { termsAccepted: fields.termsAccepted === 'true' } : {}) };
             }
             const profileMarkup = (formField: typeof baseField = baseField, presentation?: PresentationContext) => formField('displayName', 'Display name', 'text', 'nickname', false) + formField('locale', 'Preferred language', 'text', 'language', false) + metadataFields.map(([name, field]) => baseField('meta.' + name, name + (field.type === 'boolean' ? ' (' + (presentation?.text('field.booleanHint') ?? 'true or false') + ')' : ''), field.type === 'number' ? 'number' : 'text', 'off', field.required === true)).join('') + (registrationSchema.termsVersion ? `<label><input type="checkbox" name="termsAccepted" value="true" required> ${escapeHtml((presentation ?? defaultPresentation.resolve()).text('message.acceptTerms', { version: registrationSchema.termsVersion }))}</label>` : '');
+            const abuseGuard=createAbuseGuard(service,http,mount,options.challenge);
             const secondFactors = createSecondFactorFlows(options, http, mount);
             const trustedCookie = '__Host-urlcode-trusted-device';
             const trusted = (request: ExtensionRequest) => { const token = service.getSecurityPolicy().trustedDeviceTtlMs ? http.cookie(request, trustedCookie) : undefined; return token ? {trustedDevice:token} : {}; };
+            const noticeLocale = (request: ExtensionRequest, user: AuthUser) => (options.presentation ?? defaultPresentation).resolve({ ...(user.profile?.locale ? {accountLocale:user.profile.locale} : {}), ...(request.query.get('lang') ? {queryLocale:request.query.get('lang')!} : {}), ...(request.headers.get('accept-language') ? {acceptLanguage:request.headers.get('accept-language')!} : {}) }).locale;
             const flows = createAuthFlows({ ...options, onSession: async (request, result) => {
                     if (result.newDevice)
-                        await notice(result.user.email, 'new-device');
+                        await notice(result.user.email, 'new-device', noticeLocale(request,result.user));
                     return http.device(request).headers;
                 }, enrollment: { required: !!registrationSchema.termsVersion || metadataFields.some(([, field]) => field.required), fields: (presentation) => profileMarkup((name, label, ...rest) => baseField(name, presentation?.textSource(label) ?? label, ...rest), presentation), read: profileInput, names: ['displayName', 'locale', 'termsAccepted', ...metadataFields.map(([name]) => 'meta.' + name)] } }, http, mount, registration);
             const factorRecovery=createFactorRecoveryFlows(options,http,mount);
+            const manualRecovery=createManualRecoveryFlows(service,http,mount);
             const signup = createSignup(options, http, mount, { fields: p => profileMarkup((name,label,...rest)=>baseField(name,p.textSource(label),...rest),p), read: profileInput, names: ['displayName','locale','termsAccepted',...metadataFields.map(([name])=>'meta.'+name)] });
             const passkeyButton = (kind: 'register' | 'login' | 'step-up', text: (value: string) => string = value => value) => options.passkeys ? `<button type="button" data-passkey="${kind}" data-base="${escapeHtml(mount)}" data-unavailable="${escapeHtml(text('Passkeys are unavailable in this browser. Use another sign-in method.'))}" data-failed="${escapeHtml(text('Passkey request failed'))}" data-cancelled="${escapeHtml(text('Passkey ceremony cancelled'))}">${escapeHtml(text(kind === 'register' ? 'Add a passkey' : kind === 'step-up' ? 'Confirm identity with a passkey' : 'Sign in with a passkey'))}</button><p role="status" aria-live="polite" data-passkey-status></p>` : '';
             async function principal(request: ExtensionRequest): Promise<{
@@ -110,13 +120,13 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                 string
             ][] = []): AuthHttpResponse { return jsonResponse(303, { redirect: path }, [['location', path], ...headers]); }
             const createNavigation = (text: (value: string) => string) => `<nav aria-label="${escapeHtml(text('Account'))}">${[['account', 'Account'], ['sessions', 'Sessions'], ['step-up', 'Confirm identity'], ['methods', 'Sign-in methods'], ...(service.getSecurityPolicy().allowPasskeySecondFactor ? [['second-factors','Second factors']] : []), ...(service.getSecurityPolicy().trustedDeviceTtlMs ? [['trusted-devices','Remembered devices']] : [])].map(([path, label]) => `<a href="${escapeHtml(mount + '/' + path)}">${escapeHtml(text(label!))}</a>`).join('')}</nav>`;
-            async function deliver(email: string, token: string, purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change', strict = false): Promise<void> {
+            async function deliver(email: string, token: string, purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change', strict = false, locale?: string): Promise<void> {
                 if (!options.sendToken)
                     throw new AuthHttpError(503, 'Email delivery is not configured');
                 const controller = new AbortController();
                 let timer: ReturnType<typeof setTimeout> | undefined;
                 try {
-                    await Promise.race([options.sendToken({ email, token, purpose, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Delivery timeout')); }, 5000); })]);
+                    await Promise.race([options.sendToken({ email, token, purpose, ...(locale ? {locale} : {}), signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Delivery timeout')); }, 5000); })]);
                 }
                 catch (error) {
                     if (strict)
@@ -127,21 +137,21 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                         clearTimeout(timer);
                 }
             }
-            async function notify(email: string, purpose: 'verify-email' | 'reset-password'): Promise<void> {
+            async function notify(email: string, purpose: 'verify-email' | 'reset-password', locale?: string): Promise<void> {
                 if (!options.sendToken)
                     throw new AuthHttpError(503, 'Email delivery is not configured');
                 const issued = await service.issueToken({ email, purpose });
                 if (!issued.token)
                     return;
-                await deliver(email, issued.token, purpose);
+                await deliver(email, issued.token, purpose, false, locale);
             }
-            async function notice(email: string, event: 'password-changed' | 'new-device' = 'password-changed'): Promise<void> {
+            async function notice(email: string, event: 'password-changed' | 'new-device' | 'email-changed' = 'password-changed', locale?: string): Promise<void> {
                 if (!options.sendNotice)
                     return;
                 const controller = new AbortController();
                 let timer: ReturnType<typeof setTimeout> | undefined;
                 try {
-                    await Promise.race([options.sendNotice({ email, event, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
+                    await Promise.race([options.sendNotice({ email, event, ...(locale ? {locale} : {}), signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
                 }
                 catch { }
                 finally {
@@ -184,7 +194,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                     const tr = (key: string, values?: Readonly<Record<string, string | number>>) => escapeHtml(presentation.text(key, values));
                     const text = (value: string) => presentation?.textSource(value) ?? value;
                     const navigation = createNavigation(source => presentation?.textSource(source) ?? source);
-                    const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4] ?? (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? mount + '/assets/passkeys.js' : undefined), presentation] as Parameters<typeof renderPage>);
+                    const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4] ?? (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? mount + '/assets/passkeys.js' : undefined), presentation, options.challenge?.widget && (['/','/login','/identify','/forgot-password'].includes(request.path.slice(mount.length)||'/') || request.path.slice(mount.length)==='/email-code'&&!request.query.has('flowId')) ? options.challenge.widget : undefined] as Parameters<typeof renderPage>);
                     const formField = (name: string, label: string, type = 'text', autocomplete = 'off', required = true) => baseField(name, presentation?.textSource(label) ?? label, type, autocomplete, required);
                     const form = (action: string, csrf: string, fields: string, button: string) => renderForm(action + (action.includes('?') ? '&' : '?') + 'lang=' + encodeURIComponent(presentation.locale), csrf, fields, presentation?.textSource(button) ?? button);
                     const profileFields = () => profileMarkup(formField, presentation);
@@ -193,6 +203,8 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                     const passkeyLogin = (csrf: string) => options.passkeys ? `<form method="post" action="${escapeHtml(mount+'/login')}">${csrfField(csrf)}<fieldset><legend>${escapeHtml(text('Passkey sign-in'))}</legend><p>${escapeHtml(text('If your account uses a second factor, confirm it before choosing your sign-in passkey.'))}</p>${factors()}${passkeyButton('login',text)}</fieldset></form>` : '';
                     try {
                         const path = request.path.slice(mount.length) || '/';
+                        const abuseDenied=await abuseGuard(request,presentation);if(abuseDenied)return abuseDenied;
+                        const restored=await manualRecovery.handle(request,presentation);if(restored)return restored;
                         const recovered=await factorRecovery.handle(request,presentation);if(recovered)return recovered;
                         const sessionToken = http.session(request), sessionPrincipal = sessionToken ? await service.authenticate(sessionToken) : null;
                         if (sessionPrincipal && enrollmentRequired(sessionPrincipal)) {
@@ -336,7 +348,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             const device = http.device(request);
                             const result = path === '/register' ? await service.register({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, profile: profileInput(fields), ...(fields.invitationToken ? { invitationToken: fields.invitationToken } : {}) }) : await service.login({ ...trusted(request), email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             if (result.newDevice)
-                                await notice(result.user.email, 'new-device');
+                                await notice(result.user.email, 'new-device', noticeLocale(request,result.user));
                             return wantsJson(request) ? jsonResponse(path === '/register' ? 201 : 200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
                         }
                         if (path === '/send-email-code') {
@@ -347,7 +359,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                 const controller = new AbortController();
                                 let timer: ReturnType<typeof setTimeout> | undefined;
                                 try {
-                                    await Promise.race([options.sendEmailCode({ email, flowId: issued.flowId, code: issued.code, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
+                                    await Promise.race([options.sendEmailCode({ email, flowId: issued.flowId, code: issued.code, locale:presentation.locale, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
                                 }
                                 catch { }
                                 finally {
@@ -363,15 +375,16 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             const device = http.device(request);
                             const result = await service.consumeEmailCode({ ...trusted(request), device: { id: device.id, label: device.label }, flowId: fields.flowId || '', code: fields.code || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             if (result.newDevice)
-                                await notice(result.user.email, 'new-device');
+                                await notice(result.user.email, 'new-device', noticeLocale(request,result.user));
                             return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
                         }
                         if (path === '/forgot-password') {
-                            await notify(fields.email || '', 'reset-password');
+                            await notify(fields.email || '', 'reset-password',presentation.locale);
                             return jsonResponse(200, { message: presentation.textSource('If this account is eligible, a reset message will be sent.') });
                         }
                         if (path === '/verify-email-change') {
-                            await service.confirmEmailChange(fields.token || '');
+                            const changed = await service.confirmEmailChange(fields.token || '');
+                            await notice(changed.email, 'email-changed', noticeLocale(request, changed));
                             return jsonResponse(200, { changed: true }, http.clearSession());
                         }
                         if (path === '/cancel-email-change') {
@@ -389,7 +402,8 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return jsonResponse(200, { verified: true });
                         }
                         if (path === '/reset') {
-                            await service.resetPassword({ token: fields.token || '', password: fields.password || '' });
+                            const changed = await service.resetPassword({ token: fields.token || '', password: fields.password || '' });
+                            await notice(changed.email, 'password-changed', noticeLocale(request, changed));
                             return jsonResponse(200, { reset: true }, http.clearSession());
                         }
                         const current = await principal(request);
@@ -423,8 +437,8 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                 throw new AuthHttpError(503, 'Email delivery required');
                             const change = await service.requestEmailChange({ token: current.token, email: fields.email || '', ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             try {
-                                await deliver(change.oldEmail, change.cancelToken, 'cancel-email-change', true);
-                                await deliver(change.newEmail, change.verificationToken, 'verify-email-change', true);
+                                await deliver(change.oldEmail, change.cancelToken, 'cancel-email-change', true,presentation.locale);
+                                await deliver(change.newEmail, change.verificationToken, 'verify-email-change', true,presentation.locale);
                             }
                             catch {
                                 await service.cancelEmailChange(change.cancelToken);
@@ -442,7 +456,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return jsonResponse(200, await service.exportAccount(current.token), [['content-disposition', 'attachment; filename="account.json"']]);
                         if (path === '/change-password') {
                             await service.changePassword({ token: current.token, currentPassword: fields.currentPassword || '', password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
-                            await notice(current.principal.email);
+                            await notice(current.principal.email,'password-changed',presentation.locale);
                             return jsonResponse(200, { changed: true }, http.clearSession());
                         }
                         if (path === '/delete') {
@@ -451,7 +465,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             if (fields.confirmation !== 'DELETE')
                                 throw new AuthHttpError(400, 'Deletion confirmation required');
                             const result = await service.deleteAccount({ token: current.token, ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
-                            await deliver(current.principal.email, result.cancelToken, 'cancel-deletion');
+                            await deliver(current.principal.email, result.cancelToken, 'cancel-deletion',false,presentation.locale);
                             return jsonResponse(200, { deletionScheduled: true, deleteAfter: result.deleteAfter, cancellationDays: service.getSecurityPolicy().deletionGraceMs / 86400000 }, http.clearSession());
                         }
                         if (path === '/logout') {
@@ -467,7 +481,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return wantsJson(request) ? jsonResponse(200, { confirmed: true, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, http.sessionHeaders(result.token)) : redirect(mount + '/account', http.sessionHeaders(result.token));
                         }
                         if (path === '/send-verification') {
-                            await notify(current.principal.email, 'verify-email');
+                            await notify(current.principal.email, 'verify-email',presentation.locale);
                             return jsonResponse(200, { message: presentation.textSource('If this account is eligible, a verification message will be sent.') });
                         }
                         if (path === '/totp/begin') {

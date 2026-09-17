@@ -32,7 +32,7 @@ try {
     const { values, positionals } = parseArgs({ allowPositionals: true, options: { 'operator-file': { type: 'string' }, directory: { type: 'string' }, help: { type: 'boolean' } } });
     const command = positionals[0];
     if (values.help || !command)
-        process.stdout.write('urlcode-auth init --directory NEW_DIRECTORY\nurlcode-auth bootstrap|users|sessions|revoke|audit|import|rotate-key|purge|cleanup|configuration|doctor --operator-file /absolute/operator/auth.mjs\nurlcode-auth verify-deployment (JSON origin/authMount on stdin)\nurlcode-auth backup|restore (JSON paths on stdin)\nSecrets and operation data use bounded JSON stdin, never argv. Operator module default-exports an AuthService.\n');
+        process.stdout.write('urlcode-auth init --directory NEW_DIRECTORY\nurlcode-auth bootstrap|users|sessions|revoke|audit|import|rotate-key|purge|cleanup|configuration|doctor|validate --operator-file /absolute/operator/auth.mjs\nurlcode-auth auth-baseline (offline synthetic checks)\nurlcode-auth verify-deployment (JSON origin/authMount on stdin)\nurlcode-auth backup|restore (JSON paths on stdin)\nSecrets and operation data use bounded JSON stdin, never argv. Operator module default-exports an AuthService.\n');
     else {
         if (positionals.length !== 1)
             throw new Error('Invalid command');
@@ -40,9 +40,14 @@ try {
         if (command === 'init') {
             output = await initAuthentication(string(values.directory));
         }
+        else if (command === 'auth-baseline') {
+            if (values['operator-file'] || values.directory) throw new Error('Baseline accepts no operator files');
+            const { runAuthBaseline } = await import('./auth-baseline.ts');
+            const result = await runAuthBaseline(); output = result; if (!result.passed) process.exitCode = 1;
+        }
         else if (command === 'verify-deployment') {
             const data = await input();
-            const result = await verifyDeployment({ origin: string(data.origin), authMount: string(data.authMount), ...(data.allowDevelopment === true ? { allowDevelopment: true } : {}) });
+            const result = await verifyDeployment({ origin: string(data.origin), authMount: string(data.authMount), ...(data.allowDevelopment === true ? { allowDevelopment: true } : {}), ...(data.allowTurnstile === true ? { allowTurnstile: true } : {}) });
             output = result;
             if (!result.passed) process.exitCode = 1;
         }
@@ -51,7 +56,7 @@ try {
             output = command === 'backup' ? await createBackup({ database: string(data.database), destination, projectRoot }) : await restoreBackup({ backup: string(data.backup), destination, projectRoot });
         }
         else {
-            if (!['bootstrap', 'users', 'sessions', 'revoke', 'audit', 'import', 'rotate-key', 'purge', 'cleanup', 'configuration', 'doctor'].includes(command))
+            if (!['bootstrap', 'users', 'sessions', 'revoke', 'audit', 'import', 'rotate-key', 'purge', 'cleanup', 'configuration', 'doctor', 'validate'].includes(command))
                 throw new Error('Invalid command');
             if (!values['operator-file'] || !isAbsolute(values['operator-file']))
                 throw new Error('Provide an absolute operator file');
@@ -78,6 +83,10 @@ try {
                 output = await service.cleanup({ limit: 1000 });
             else if (command === 'configuration')
                 output = { revision: await service.getConfigurationRevision(), registration: service.getRegistrationMode(), security: service.getSecurityPolicy(), roles: service.getRoles() };
+            else if (command === 'validate') {
+                const { validateAuthService } = await import('./auth-baseline.ts');
+                output = await validateAuthService(service);
+            }
             else if (command === 'doctor')
                 output = { database: 'ready', registration: service.getRegistrationMode(), security: service.getSecurityPolicy(), accounts: (await service.dashboard()).users, liveProviders: 'unverified' };
             else if (command === 'import') {

@@ -24,6 +24,12 @@ test('operator CLI bootstraps without exposing session/password and supports bac
     const configuration = run('configuration');
     assert.equal(configuration.status, 0, configuration.stderr);
     assert.match(JSON.parse(configuration.stdout).revision, /^[a-f0-9]{64}$/);
+    const validated = run('validate');
+    assert.equal(validated.status, 0, validated.stderr);
+    assert.equal(JSON.parse(validated.stdout).revision, JSON.parse(configuration.stdout).revision);
+    assert.equal(JSON.parse(validated.stdout).liveProviders, 'unverified');
+    assert.ok(!validated.stdout.includes(password));
+    assert.ok(!validated.stdout.includes(database));
     const doctor = run('doctor');
     assert.equal(doctor.status, 0, doctor.stderr);
     assert.equal(JSON.parse(doctor.stdout).accounts, 1);

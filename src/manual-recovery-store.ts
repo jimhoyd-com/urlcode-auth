@@ -29,10 +29,11 @@ export function manualRecoveryOperation(operation:string,args:Record<string,unkn
   db.prepare('INSERT INTO auth_cases(id,data) VALUES(?,?)').run(item.id,JSON.stringify(item));context.audit(maker.id,'recovery.case_created',target.id,now,item.reason);return {value:item};
  }
  case 'manualRecoveryList':return {value:db.prepare("SELECT data FROM auth_cases WHERE id>? AND json_extract(data,'$.action')='restore-access' ORDER BY id LIMIT ?").all(String(args.after),Number(args.limit)).map(row=>JSON.parse(String(row.data)))};
+ case 'manualRecoveryCheck':{const credential=db.prepare('SELECT * FROM auth_manual_recovery WHERE hash=? AND active=1 AND expires>?').get(String(args.tokenHash),now);if(!credential)fail(401,'invalid_recovery');const item=rowCase(String(credential.case_id)),target=targetFor(item);authorize(item,target);return {value:undefined};}
  case 'manualRecoveryApprove':{
   const checker=context.fresh(String(args.hash),now).user,item=rowCase(String(args.id));if(item.status!=='pending'||item.expires<=now)fail(409,'case_unavailable');if(item.makerId===checker.id)fail(403,'distinct_approver_required');
   const target=targetFor(item);authorize(item,target);context.authorizeCase(checker,target);availableEmail(item.recovery.email,target.id);
-  db.prepare('INSERT INTO auth_manual_recovery(hash,case_id,account_id,version,approver_id,active,expires) VALUES(?,?,?,?,?,0,?)').run(String(args.tokenHash),item.id,target.id,target.version,checker.id,now+1800000);
+  db.prepare('INSERT INTO auth_manual_recovery(hash,case_id,account_id,version,approver_id,maker_version,approver_version,active,expires) VALUES(?,?,?,?,?,?,?,0,?)').run(String(args.tokenHash),item.id,target.id,target.version,checker.id,context.active(item.makerId).version,checker.version,now+1800000);
   item.status='applied';item.approverId=checker.id;item.recovery.state='delivery';saveCase(item);context.audit(checker.id,'recovery.case_approved',target.id,now,String(args.reason));return {value:{case:item,email:item.recovery.email,oldEmail:target.email}};
  }
  case 'manualRecoveryActivate':case 'manualRecoveryCancel':{
@@ -40,17 +41,17 @@ export function manualRecoveryOperation(operation:string,args:Record<string,unkn
   if(!credential||credential.approver_id!==checker.id||item.approverId!==checker.id)fail(409,'recovery_unavailable');
   if(operation==='manualRecoveryCancel'){db.prepare('DELETE FROM auth_manual_recovery WHERE case_id=?').run(item.id);item.recovery.state='cancelled';item.status='closed';saveCase(item);context.audit(checker.id,'recovery.delivery_cancelled',item.accountId,now);return {value:undefined};}
   if(Number(credential.expires)<=now||credential.active!==0||item.recovery.state!=='delivery')fail(409,'recovery_unavailable');
-  const target=targetFor(item);authorize(item,target);availableEmail(item.recovery.email,target.id);
+  const target=targetFor(item);authorize(item,target);if(context.active(item.makerId).version!==credential.maker_version||checker.version!==credential.approver_version)fail(409,'recovery_approval_changed');availableEmail(item.recovery.email,target.id);
   db.prepare('UPDATE auth_manual_recovery SET active=1 WHERE hash=?').run(String(args.tokenHash));item.recovery.state='ready';saveCase(item);context.audit(checker.id,'recovery.delivery_confirmed',item.accountId,now);return {value:undefined};
  }
  case 'manualRecoveryRedeem':{
   const credential=db.prepare('SELECT * FROM auth_manual_recovery WHERE hash=? AND active=1 AND expires>?').get(String(args.tokenHash),now);if(!credential)fail(401,'invalid_recovery');
-  const item=rowCase(String(credential.case_id));if(item.recovery.state!=='ready')fail(401,'invalid_recovery');const target=targetFor(item);authorize(item,target);availableEmail(item.recovery.email,target.id);
+  const item=rowCase(String(credential.case_id));if(item.recovery.state!=='ready')fail(401,'invalid_recovery');const target=targetFor(item);authorize(item,target);if(context.active(item.makerId).version!==credential.maker_version||context.active(item.approverId!).version!==credential.approver_version)fail(409,'recovery_approval_changed');availableEmail(item.recovery.email,target.id);
   if(context.isAdministrator(target)&&!db.prepare("SELECT data FROM auth_accounts WHERE administrator=1 AND status='active' AND id<>?").all(target.id).some(row=>!context.isRestricted(JSON.parse(String(row.data)) as AuthRecord)))fail(409,'last_administrator_required');
   target.email=item.recovery.email;target.emailVerified=true;target.passwordHash=String(args.passwordHash);target.status='active';target.mfaRecoveryRequired=true;target.version++;
   delete target.totpSecret;delete target.totpPending;delete target.totpPendingUntil;delete target.mfaPasskeys;target.totpCounter=-1;
   db.prepare('UPDATE auth_accounts SET email=? WHERE id=?').run(target.email,target.id);context.save(target);
-  for(const table of ['auth_sessions','auth_tokens','auth_recovery','auth_passkeys','auth_external','auth_email_codes','auth_email_changes','auth_factor_recovery','auth_second_factor_proofs','auth_trusted_devices','auth_manual_recovery'])db.prepare(`DELETE FROM ${table} WHERE account_id=?`).run(target.id);
+  for(const table of ['auth_sessions','auth_tokens','auth_recovery','auth_method_activity','auth_passkeys','auth_external','auth_email_codes','auth_email_changes','auth_factor_recovery','auth_second_factor_proofs','auth_trusted_devices','auth_manual_recovery'])db.prepare(`DELETE FROM ${table} WHERE account_id=?`).run(target.id);
   const session=args.session as SessionRecord;session.accountId=target.id;session.recoveryEnrollment=1;session.primaryMethod='recovery';session.mfaAuthenticatedAt=0;session.mfaVersion=0;context.addSession(session);
   item.recovery.state='redeemed';saveCase(item);context.audit(target.id,'recovery.access_restored',target.id,now,item.id);return {value:target};
  }

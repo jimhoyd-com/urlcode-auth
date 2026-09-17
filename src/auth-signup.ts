@@ -9,9 +9,9 @@ import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField, jsonResponse
 export function createSignup(options: AuthExtensionOptions, http: AuthHttp, mount: string, profile: { fields(p: PresentationContext): string; read(fields: Record<string,string>): RegistrationInput; names: string[] }) {
  const service=options.service, browserCookie='__Host-urlcode-signup-browser', flowCookie='__Host-urlcode-signup';
  const clear=()=>[['set-cookie',http.setCookie(flowCookie,'',0)]] as [string,string][];
- async function delivery(message: {kind:string;email:string;code?:string}) {
+ async function delivery(message: {kind:string;email:string;code?:string}, locale: string) {
   const controller=new AbortController(); let timer:ReturnType<typeof setTimeout>|undefined;
-  try { const operation=message.kind==='signup-code' ? options.sendSignupCode?.({email:message.email,code:message.code!,signal:controller.signal}) : options.sendNotice?.({email:message.email,event:message.kind==='new-device'?'new-device':'registration-attempt',signal:controller.signal});
+  try { const operation=message.kind==='signup-code' ? options.sendSignupCode?.({email:message.email,code:message.code!,locale,signal:controller.signal}) : options.sendNotice?.({email:message.email,event:message.kind==='new-device'?'new-device':'registration-attempt',locale,signal:controller.signal});
    if(!operation && message.kind==='signup-code') throw new AuthHttpError(503,'Email delivery is not configured');
    if(operation) await Promise.race([operation,new Promise<void>((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error('Delivery timeout'));},5000);})]);
   } catch { /* The same public result is returned for every eligible identifier. */ }
@@ -39,13 +39,13 @@ export function createSignup(options: AuthExtensionOptions, http: AuthHttp, moun
    if(!state){
     const invitations=request.query.getAll('token');
     if(invitations.length>1||(invitations[0]&&!/^[A-Za-z0-9_-]{43}$/.test(invitations[0])))throw new AuthHttpError(400,'Invalid invitation');
-    markup=form('begin',field('email','Email address','email','email')+(service.getRegistrationMode()==='invite-only'?(invitations[0]?`<input type="hidden" name="invitationToken" value="${escapeHtml(invitations[0])}">`:field('invitationToken','Invitation token')):''),'Continue');
+    markup=form('begin',field('email','Email address','email','email')+'<div hidden><label>Leave empty<input name="website" tabindex="-1" autocomplete="off"></label></div>'+(service.getRegistrationMode()==='invite-only'?(invitations[0]?`<input type="hidden" name="invitationToken" value="${escapeHtml(invitations[0])}">`:field('invitationToken','Invitation token')):''),'Continue');
    }
    else if(state.step==='verify-email')markup=`<p>${e('Check your email for a signup code. Enter it to continue.')}</p>`+form('verify',field('code','Email code','text','one-time-code'),'Verify email');
    else if(state.step==='credential')markup=form('password',field('password','Password (at least 15 characters)','password','new-password'),'Continue')+(options.passkeys?`<button type="button" data-passkey="signup" data-base="${escapeHtml(mount)}" data-failed="${e('Passkey request failed')}" data-unavailable="${e('Passkeys are unavailable in this browser. Use another sign-in method.')}" data-cancelled="${e('Passkey ceremony cancelled')}">${e('Create a passkey')}</button><p role="status" aria-live="polite" data-passkey-status></p>`:'');
    else markup=form('complete',profile.fields(presentation),'Create account');
    if(state)markup+=form('restart','','Start again');
-   return pageResponse('Create account',markup,200,headers,state?.step==='credential'&&options.passkeys?mount+'/assets/passkeys.js':undefined,presentation);
+   return pageResponse('Create account',markup,200,headers,state?.step==='credential'&&options.passkeys?mount+'/assets/passkeys.js':undefined,presentation,!state?options.challenge?.widget:undefined);
   }
   if(!existingBrowser)throw new AuthHttpError(403,'Signup browser binding required');
   // WebAuthn returns nested JSON; parse its bounded envelope separately from ordinary form fields.
@@ -58,12 +58,12 @@ export function createSignup(options: AuthExtensionOptions, http: AuthHttp, moun
    await service.setSignupPasskey({...binding,challenge:pending.challenge,credential});
    return jsonResponse(200,{step:'profile'},headers);
   }
-  const fields=readFields(request,['email','invitationToken','code','password',...profile.names]);http.verify(request,fields);
+  const fields=readFields(request,['email','invitationToken','code','password','website',...profile.names]);http.verify(request,fields);
   if(path==='/signup/restart')return redirect(clear());
   if(path==='/signup/begin') {
    if(service.getSecurityPolicy().requireEmailVerification&&!options.sendSignupCode)throw new AuthHttpError(503,'Email delivery is not configured');
    const started=await service.beginSignup({email:fields.email||'',browserHash,...(fields.invitationToken?{invitationToken:fields.invitationToken}:{})});
-   if(started.delivery)await delivery(started.delivery);
+   if(started.delivery)await delivery(started.delivery,presentation.locale);
    const cookies:[string,string][]=[['set-cookie',http.setCookie(flowCookie,started.flowId,1800)]];
    return wantsJson(request)?jsonResponse(200,{step:started.step,expires:started.expires},[...headers,...cookies]):redirect(cookies);
   }
@@ -79,7 +79,7 @@ export function createSignup(options: AuthExtensionOptions, http: AuthHttp, moun
   } else if(path==='/signup/complete') {
    const device=http.device(request),result=await service.completeSignup({...binding,profile:profile.read(fields),device:{id:device.id,label:device.label}});
    const resultHeaders=[...headers,...clear(),...(result?http.sessionHeaders(result.token):[])];
-   if(result?.newDevice)await delivery({kind:'new-device',email:result.user.email});
+   if(result?.newDevice)await delivery({kind:'new-device',email:result.user.email},options.presentation?.resolve({...(result.user.profile?.locale?{accountLocale:result.user.profile.locale}:{}),queryLocale:presentation.locale}).locale??presentation.locale);
    // Existing-account attempts finish at sign-in; no existing credentials are replaced.
    const target=mount+(result?'/account':service.getRegistrationMode()==='waitlist'?'/signup/pending':'/login');
    return wantsJson(request)?jsonResponse(200,{complete:true,redirect:target,...(result?{csrf:http.token(result.token)}:{})},resultHeaders):jsonResponse(303,{redirect:target},[['location',target],...resultHeaders]);

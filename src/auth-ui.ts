@@ -1,3 +1,5 @@
+import { addTurnstileWidgets, turnstileOrigin, turnstileScript } from './challenge-ui.ts';
+import type { TurnstileWidget } from './challenge-ui.ts';
 import { englishCatalogue } from './presentation.ts';
 import type { PresentationContext } from './presentation.ts';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -19,7 +21,7 @@ const encoder = new TextEncoder();
 const securityHeaders: [
     string,
     string
-][] = [['cache-control', 'no-store'], ['content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"], ['referrer-policy', 'no-referrer'], ['x-content-type-options', 'nosniff']];
+][] = [['cache-control', 'no-store'], ['content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"], ['referrer-policy', 'strict-origin'], ['x-content-type-options', 'nosniff']];
 export function jsonResponse(status: number, value: unknown, headers: [
     string,
     string
@@ -28,15 +30,17 @@ export function jsonResponse(status: number, value: unknown, headers: [
 export function pageResponse(title: string, markup: string, status = 200, headers: [
     string,
     string
-][] = [], scriptPath?: string, presentation?: PresentationContext): AuthHttpResponse {
+][] = [], scriptPath?: string, presentation?: PresentationContext, turnstile?: TurnstileWidget): AuthHttpResponse {
     const titleKey = Object.entries(englishCatalogue).find(([key, value]) => key.startsWith('page.') && value === title)?.[0];
     title = presentation ? (titleKey ? presentation.text(titleKey) : presentation.textSource(title)) : title;
-    const nonce = scriptPath ? randomBytes(18).toString('base64') : undefined;
-    const html = `<!doctype html><html lang="${escapeHtml(presentation?.lang ?? 'en')}" dir="${presentation?.dir ?? 'ltr'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title>${presentation?.favicon ? `<link rel="icon" href="${escapeHtml(presentation.favicon)}">` : ""}<style>:root{${presentation?.cssVariables ?? ""}}body{font:1rem system-ui,sans-serif;line-height:1.5;max-width:58rem;margin:2rem auto;padding:0 1rem;color:var(--auth-foreground,#171717);background:var(--auth-background,#fff)}a{color:var(--auth-accent,#0645ad)}label{display:block;margin-block:1rem .25rem}input,select,button{font:inherit;padding:.5rem;max-width:100%;box-sizing:border-box;border-radius:var(--auth-radius,0)}button{margin-block:1rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid var(--auth-border,#aaa);text-align:start;padding:.5rem;overflow-wrap:anywhere}caption{text-align:start;font-weight:bold}code{overflow-wrap:anywhere}.error{border-inline-start:.25rem solid #a00;padding:1rem}nav{display:flex;gap:1rem;flex-wrap:wrap}section{margin-block:2rem}a:focus-visible,input:focus-visible,button:focus-visible,select:focus-visible{outline:3px solid #164bdb;outline-offset:3px}</style></head><body>${presentation?.logo ? `<img src="${escapeHtml(presentation.logo)}" alt="" width="120">` : ""}<a href="#main">${escapeHtml(presentation?.text('nav.skip') ?? 'Skip to content')}</a><main id="main"><h1>${escapeHtml(title)}</h1>${markup}</main>${scriptPath ? `<script nonce="${nonce}" src="${escapeHtml(scriptPath)}" defer></script>` : ''}</body></html>`;
+    const challenge = addTurnstileWidgets(markup, turnstile);
+    markup = challenge.markup;
+    const nonce = scriptPath || challenge.enabled ? randomBytes(18).toString('base64') : undefined;
+    const html = `<!doctype html><html lang="${escapeHtml(presentation?.lang ?? 'en')}" dir="${presentation?.dir ?? 'ltr'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title>${presentation?.favicon ? `<link rel="icon" href="${escapeHtml(presentation.favicon)}">` : ""}<style>:root{${presentation?.cssVariables ?? ""}}body{font:1rem system-ui,sans-serif;line-height:1.5;max-width:58rem;margin:2rem auto;padding:0 1rem;color:var(--auth-foreground,#171717);background:var(--auth-background,#fff)}a{color:var(--auth-accent,#0645ad)}label{display:block;margin-block:1rem .25rem}input,select,button{font:inherit;padding:.5rem;max-width:100%;box-sizing:border-box;border-radius:var(--auth-radius,0)}button{margin-block:1rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid var(--auth-border,#aaa);text-align:start;padding:.5rem;overflow-wrap:anywhere}caption{text-align:start;font-weight:bold}code{overflow-wrap:anywhere}.error{border-inline-start:.25rem solid #a00;padding:1rem}nav{display:flex;gap:1rem;flex-wrap:wrap}section{margin-block:2rem}a:focus-visible,input:focus-visible,button:focus-visible,select:focus-visible{outline:3px solid #164bdb;outline-offset:3px}</style></head><body>${presentation?.logo ? `<img src="${escapeHtml(presentation.logo)}" alt="" width="120">` : ""}<a href="#main">${escapeHtml(presentation?.text('nav.skip') ?? 'Skip to content')}</a><main id="main"><h1>${escapeHtml(title)}</h1>${markup}</main>${scriptPath ? `<script nonce="${nonce}" src="${escapeHtml(scriptPath)}" defer></script>` : ''}${challenge.enabled ? `<script nonce="${nonce}" src="${turnstileScript}" async defer></script>` : ''}</body></html>`;
     return { status, headers: [...securityHeaders.map(([name, value]): [
                 string,
                 string
-            ] => [name, name === 'content-security-policy' ? value + (presentation?.logo || presentation?.favicon ? "; img-src 'self'" : '') + (nonce ? `; script-src 'nonce-${nonce}'` : '') : value]), ['content-type', 'text/html; charset=utf-8'], ...headers], body: encoder.encode(html) };
+            ] => [name, name === 'content-security-policy' ? value + (presentation?.logo || presentation?.favicon ? "; img-src 'self'" : '') + (nonce ? `; script-src 'nonce-${nonce}'${challenge.enabled ? ' ' + turnstileOrigin : ''}` : '') + (challenge.enabled ? `; frame-src ${turnstileOrigin}; connect-src 'self' ${turnstileOrigin}` : '') : value]), ['content-type', 'text/html; charset=utf-8'], ...headers], body: encoder.encode(html) };
 }
 export function formField(name: string, label: string, type = 'text', autocomplete = 'off', required = true): string { const id = name + '-' + randomBytes(6).toString('hex'); return `<label for="${escapeHtml(id)}">${escapeHtml(label)}</label><input id="${escapeHtml(id)}" name="${escapeHtml(name)}" type="${escapeHtml(type)}" autocomplete="${escapeHtml(autocomplete)}" maxlength="1024"${required ? ' required' : ''}>`; }
 export function csrfField(token: string): string { return `<input type="hidden" name="csrf" value="${escapeHtml(token)}">`; }
@@ -75,7 +79,7 @@ export function readFields(request: ExtensionRequest, allowed: string[]): Record
     if (entries.length > 64)
         throw new AuthHttpError(400, 'Too many fields');
     for (const [key, value] of entries) {
-        if (![...allowed, 'csrf'].includes(key) || Object.hasOwn(result, key) || typeof value !== 'string' || value.length > 4096)
+        if (![...allowed, 'csrf', 'challengeToken'].includes(key) || Object.hasOwn(result, key) || typeof value !== 'string' || value.length > (key === 'challengeToken' ? 2048 : 4096))
             throw new AuthHttpError(400, 'Invalid request field');
         result[key] = value;
     }
@@ -198,7 +202,8 @@ export const passkeyScript = String.raw `(() => {
    const base=button.dataset.base,kind=button.dataset.passkey,csrf=(form||document).querySelector('input[name="csrf"]').value;
    const post=async(path,data)=>{const response=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:JSON.stringify(data)});const result=await response.json();if(!response.ok)throw new Error(button.dataset.failed);return result;};
    const prefix=kind==='signup'?'/signup/passkeys':kind==='second-factor'?'/second-factor':'/passkeys/'+kind;
-   const started=await post(prefix+'/options',{}),options=started.options;options.challenge=decode(options.challenge);
+   const challengeToken=kind==='login'?form?.querySelector('input[name="challengeToken"]')?.value:undefined;
+   const started=await post(prefix+'/options',challengeToken?{challengeToken}:{}),options=started.options;options.challenge=decode(options.challenge);
    if(options.user)options.user.id=decode(options.user.id);
    for(const item of options.excludeCredentials||options.allowCredentials||[])item.id=decode(item.id);
    const credential=(kind==='register'||kind==='signup')?await navigator.credentials.create({publicKey:options}):await navigator.credentials.get({publicKey:options});

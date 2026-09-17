@@ -1,3 +1,10 @@
+import {adminAccountOperation} from './admin-account-store.ts';
+import {abuseOperation} from './abuse-store.ts';
+import {abuseKey} from './abuse.ts';
+import type {AuthAbusePolicy} from './abuse.ts';
+import { queryUsers } from './user-query.ts';
+import type { UserQuery } from './user-query.ts';
+import {manualRecoveryOperation} from './manual-recovery-store.ts';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import { createHash } from 'node:crypto';
@@ -56,9 +63,11 @@ export interface StoreOptions {
     sessionIdleMs: number;
     sessionTtlMs: number;
     securityPolicy: {
+        abuse?:AuthAbusePolicy;
         allowPasskeySecondFactor?: true;
         trustedDeviceTtlMs?: number;
         allowEmailFactorRecovery?: true;
+        allowManualRecovery?: true;
         requireEmailVerification: boolean;
         requireMfa: boolean;
         deletionGraceMs: number;
@@ -185,6 +194,9 @@ if (!isMainThread && workerData?.authStore) {
         db.prepare('DELETE FROM auth_daily_metrics WHERE day<?').run(day - 29);
         db.prepare('INSERT INTO auth_daily_metrics(day,method,event,count) VALUES(?,?,?,?) ON CONFLICT(day,method,event) DO UPDATE SET count=count+excluded.count').run(day, method, event, count);
     };
+    const methodActivity = (kind:string, methodId:string, accountId:string, time:number, added=false) => {
+        db.prepare('INSERT INTO auth_method_activity(kind,method_id,account_id,added,last_used) VALUES(?,?,?,?,?) ON CONFLICT(kind,method_id) DO UPDATE SET last_used=excluded.last_used').run(kind,methodId,accountId,added?time:null,added?null:time);
+    };
     const audit = (actor: string, action: string, subject: string, now: number, reason = '') => {
         db.prepare('INSERT INTO auth_audit(actor,action,subject,created,reason) VALUES(?,?,?,?,?)').run(actor, action, subject, now, reason);
         db.prepare('DELETE FROM auth_audit WHERE id <= (SELECT max(id)-100000 FROM auth_audit)').run();
@@ -283,6 +295,7 @@ if (!isMainThread && workerData?.authStore) {
         if (primaryCredential === proof.credentialId)
             error(401, 'independent_second_factor_required');
         passkeyProof(user, proof, true);
+        methodActivity('passkey',String(proof.credentialId),user.id,now);
         db.prepare('DELETE FROM auth_second_factor_proofs WHERE hash=?').run(String(args.secondFactorHash));
     };
     const consumeFactor = (user: AuthRecord, args: Record<string, unknown>, now: number): boolean => {
@@ -369,14 +382,18 @@ if (!isMainThread && workerData?.authStore) {
             db.exec('ALTER TABLE auth_sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_sessions ADD COLUMN device_label TEXT;UPDATE auth_sessions SET last_seen=created;');
         if (!db.prepare('PRAGMA table_info(auth_waitlist)').all().some(row => row.name === 'email_verified'))
             db.exec('ALTER TABLE auth_waitlist ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_waitlist ADD COLUMN passkey TEXT;');
+        db.exec('CREATE TABLE IF NOT EXISTS auth_manual_recovery(hash TEXT PRIMARY KEY,case_id TEXT NOT NULL UNIQUE REFERENCES auth_cases(id) ON DELETE CASCADE,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,version INTEGER NOT NULL,approver_id TEXT NOT NULL,maker_version INTEGER NOT NULL,approver_version INTEGER NOT NULL,active INTEGER NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_manual_recovery_expiry ON auth_manual_recovery(expires);');
         db.exec('CREATE TABLE IF NOT EXISTS auth_factor_recovery(account_id TEXT PRIMARY KEY REFERENCES auth_accounts(id) ON DELETE CASCADE,verification_hash TEXT NOT NULL UNIQUE,cancel_hash TEXT NOT NULL UNIQUE,browser_hash TEXT NOT NULL,version INTEGER NOT NULL,complete_after INTEGER,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_factor_recovery_expiry ON auth_factor_recovery(expires);');
         if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'primary_method'))
             db.exec("ALTER TABLE auth_sessions ADD COLUMN primary_method TEXT NOT NULL DEFAULT 'unknown';ALTER TABLE auth_sessions ADD COLUMN primary_credential TEXT;ALTER TABLE auth_sessions ADD COLUMN mfa_authenticated_at INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_sessions ADD COLUMN mfa_version INTEGER NOT NULL DEFAULT 0;");
         db.exec('CREATE TABLE IF NOT EXISTS auth_second_factor_proofs(hash TEXT PRIMARY KEY,browser TEXT NOT NULL,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,version INTEGER NOT NULL,proof TEXT NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_second_factor_expiry ON auth_second_factor_proofs(expires);CREATE TABLE IF NOT EXISTS auth_trusted_devices(hash TEXT PRIMARY KEY,id TEXT NOT NULL UNIQUE,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,version INTEGER NOT NULL,label TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_trusted_expiry ON auth_trusted_devices(expires);');
+        db.exec('CREATE TABLE IF NOT EXISTS auth_admin_operations(id TEXT PRIMARY KEY,data TEXT NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_admin_operations_expiry ON auth_admin_operations(expires);');
+        db.exec('CREATE TABLE IF NOT EXISTS auth_method_activity(kind TEXT NOT NULL,method_id TEXT NOT NULL,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,added INTEGER,last_used INTEGER,PRIMARY KEY(kind,method_id));CREATE INDEX IF NOT EXISTS auth_method_activity_account ON auth_method_activity(account_id);');
+        db.exec('CREATE TABLE IF NOT EXISTS auth_abuse(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires INTEGER NOT NULL,blocked_until INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_abuse_expiry ON auth_abuse(expires);');
         db.exec('CREATE TABLE IF NOT EXISTS auth_signups(hash TEXT PRIMARY KEY,browser TEXT NOT NULL,email TEXT NOT NULL,account_id TEXT NOT NULL,step TEXT NOT NULL,expires INTEGER NOT NULL,code_hash TEXT NOT NULL,code_expires INTEGER NOT NULL,attempts INTEGER NOT NULL,eligible INTEGER NOT NULL,invitation_hash TEXT NOT NULL,credential TEXT,challenge TEXT);CREATE INDEX IF NOT EXISTS auth_signups_expiry ON auth_signups(expires);');
         if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'recovery_enrollment'))
             db.exec('ALTER TABLE auth_sessions ADD COLUMN recovery_enrollment INTEGER NOT NULL DEFAULT 0');
-        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), ...(options.sessionTtlMs !== 86400000 || options.sessionIdleMs !== 1800000 ? { sessionLimits: { absoluteMs: options.sessionTtlMs, idleMs: options.sessionIdleMs } } : {}), ...(options.securityPolicy.allowPasskeySecondFactor || options.securityPolicy.trustedDeviceTtlMs || options.securityPolicy.allowEmailFactorRecovery || options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
+        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), ...(options.sessionTtlMs !== 86400000 || options.sessionIdleMs !== 1800000 ? { sessionLimits: { absoluteMs: options.sessionTtlMs, idleMs: options.sessionIdleMs } } : {}), ...(options.securityPolicy.allowManualRecovery || options.securityPolicy.allowPasskeySecondFactor || options.securityPolicy.trustedDeviceTtlMs || options.securityPolicy.allowEmailFactorRecovery || options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
         configurationRevision = transaction(() => {
             const previous = db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value;
             const currentDefinition = db.prepare("SELECT value FROM auth_meta WHERE key='configurationDefinition'").get()?.value ?? previous;
@@ -405,7 +422,7 @@ if (!isMainThread && workerData?.authStore) {
                 if (priorAdministrators > 0 && nextAdministrators === 0)
                     error(503, 'configuration_admin_required');
                 const counts: Record<string, number> = {};
-                for (const table of ['auth_sessions', 'auth_tokens', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices'])
+                for (const table of ['auth_sessions', 'auth_tokens', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices', 'auth_manual_recovery','auth_abuse','auth_admin_operations'])
                     counts[table] = num(db.prepare('SELECT count(*) AS n FROM ' + table).get()?.n);
                 const adminRoles = Object.keys(roles).filter(role => roles[role]!.includes('*'));
                 const adminSql = adminRoles.length ? "EXISTS(SELECT 1 FROM json_each(auth_accounts.data,'$.roles') WHERE value IN (" + adminRoles.map(() => '?').join(',') + '))' : '0';
@@ -414,9 +431,10 @@ if (!isMainThread && workerData?.authStore) {
                 db.prepare("UPDATE auth_tokens SET version=(SELECT json_extract(data,'$.version') FROM auth_accounts WHERE id=auth_tokens.account_id) WHERE purpose='cancel-deletion'").run();
                 const cancellationTokens = num(db.prepare('SELECT count(*) AS n FROM auth_tokens').get()?.n);
                 counts.auth_tokens = (counts.auth_tokens ?? 0) - cancellationTokens;
-                for (const table of ['auth_sessions', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices'])
+                for (const table of ['auth_sessions', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices', 'auth_manual_recovery','auth_abuse','auth_admin_operations'])
                     db.prepare('DELETE FROM ' + table).run();
                 counts.auth_cases = Number(db.prepare("UPDATE auth_cases SET data=json_set(data,'$.status','closed') WHERE json_extract(data,'$.status')='pending'").run().changes);
+                counts.auth_cases += Number(db.prepare("UPDATE auth_cases SET data=json_set(data,'$.status','closed','$.recovery.state','cancelled') WHERE json_extract(data,'$.action')='restore-access' AND json_extract(data,'$.recovery.state') IN ('delivery','ready')").run().changes);
                 db.prepare("UPDATE auth_meta SET value=? WHERE key='configuration'").run(nextRevision);
                 db.prepare("INSERT INTO auth_meta VALUES('configurationMigration',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify({ from: previous, to: nextRevision }));
                 audit('operator', 'configuration.changed', nextRevision, options.configurationChangeAt, JSON.stringify({ from: previous, revoked: counts, preservedCancellationTokens: cancellationTokens }));
@@ -477,7 +495,10 @@ if (!isMainThread && workerData?.authStore) {
                 error(503, 'stale_encryption_key');
             const now = Number(args.now);
             let value: unknown;
-            switch (operation) {
+            const manual=manualRecoveryOperation(operation,args,{db,now,enabled:options.securityPolicy.allowManualRecovery===true,account,active,fresh,authorizeCase,save,addSession,audit,isAdministrator:user=>admin(user.roles),isRestricted:restricted,fail:error});
+            const abuse=abuseOperation(operation,args,db,options.securityPolicy.abuse,error);
+            const administration=adminAccountOperation(operation,args,{db,now,deletionGraceMs:options.securityPolicy.deletionGraceMs,roles:options.roles,account,fresh,isRestricted:restricted,save,audit,fail:error});
+            if(manual)value=manual.value;else if(abuse)value=abuse.value;else if(administration)value=administration.value;else switch (operation) {
                 case 'factorRecoveryBegin': {
                     if (!options.securityPolicy.allowEmailFactorRecovery)
                         error(403, 'factor_recovery_disabled');
@@ -727,6 +748,7 @@ if (!isMainThread && workerData?.authStore) {
                         if (db.prepare('SELECT id FROM auth_passkeys WHERE id=?').get(passkey.id))
                             error(409, 'credential_already_registered');
                         db.prepare('INSERT INTO auth_passkeys VALUES(?,?,?,?)').run(passkey.id, user.id, JSON.stringify(passkey), passkey.counter);
+                        methodActivity('passkey', String(passkey.id), user.id, now, true);
                     }
                     if (credential.passkey)
                         Object.assign(args.session!, { primaryMethod: 'passkey', primaryCredentialId: credential.passkey.id });
@@ -760,6 +782,7 @@ if (!isMainThread && workerData?.authStore) {
                 case 'login':
                     value = transaction(() => {
                         const user = active(String(args.accountId));
+                        if(args.abuseKey&&db.prepare('SELECT key FROM auth_abuse WHERE key=? AND blocked_until>? AND expires>?').get(String(args.abuseKey),now,now))error(429,'auth_backoff');
                         if (args.proof) {
                             const proof = args.proof as {
                                 kind: string;
@@ -774,10 +797,12 @@ if (!isMainThread && workerData?.authStore) {
                             if (user.version !== proof.version)
                                 error(401, 'stale_auth_proof');
                             if (proof.kind === 'oidc') {
+                                methodActivity('oidc',String(proof.provider)+'\0'+String(proof.subject),user.id,now);
                                 if (!db.prepare('SELECT account_id FROM auth_external WHERE provider=? AND subject=? AND account_id=?').get(String(proof.provider), String(proof.subject), user.id))
                                     error(401, 'stale_auth_proof');
                             }
                             else if (proof.kind === 'passkey') {
+                                methodActivity('passkey',String(proof.credentialId),user.id,now);
                                 const credential = db.prepare('SELECT data,counter FROM auth_passkeys WHERE id=? AND account_id=?').get(String(proof.credentialId), user.id);
                                 if (!credential || num(credential.counter) !== proof.expectedCounter || createHash('sha256').update(String(JSON.parse(String(credential.data)).publicKey)).digest('hex') !== proof.publicKeyHash)
                                     error(401, 'stale_auth_proof');
@@ -807,6 +832,7 @@ if (!isMainThread && workerData?.authStore) {
                             Object.assign(args.session!, { mfaAuthenticatedAt: now, mfaVersion: user.version });
                         const newDevice = addSession(args.session as unknown as SessionRecord);
                         db.prepare('DELETE FROM auth_attempts WHERE key=?').run(String(args.attemptKey));
+                        if(args.abuseKey)db.prepare('DELETE FROM auth_abuse WHERE key=?').run(String(args.abuseKey));
                         audit(user.id, args.oldHash ? 'session.step_up' : 'session.login', user.id, now);
                         if (!args.oldHash)
                             metric('success', args.proof ? String((args.proof as {
@@ -864,6 +890,8 @@ if (!isMainThread && workerData?.authStore) {
                         }
                         else {
                             user.passwordHash = String(args.passwordHash);
+                            db.prepare('DELETE FROM auth_abuse WHERE key=?').run(abuseKey('password',user.email));
+                            db.prepare('DELETE FROM auth_attempts WHERE key=?').run(createHash('sha256').update('urlcode-auth-attempt:login:'+user.email).digest('hex'));
                             db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
                         }
                         user.version++;
@@ -999,6 +1027,7 @@ if (!isMainThread && workerData?.authStore) {
                         if (db.prepare('SELECT account_id FROM auth_external WHERE provider=? AND subject=?').get(String(args.provider), String(args.subject)))
                             error(409, 'identity_already_linked');
                         db.prepare('INSERT INTO auth_external VALUES(?,?,?)').run(String(args.provider), String(args.subject), user.id);
+                        methodActivity('oidc', String(args.provider)+'\0'+String(args.subject), user.id, now, true);
                         user.version++;
                         save(user);
                         audit(user.id, 'identity.linked', user.id, now);
@@ -1016,6 +1045,7 @@ if (!isMainThread && workerData?.authStore) {
                             error(409, 'identity_already_linked');
                         db.prepare('INSERT INTO auth_accounts VALUES(?,?,?,?,?)').run(user.id, user.email, user.status, 0, JSON.stringify(user));
                         db.prepare('INSERT INTO auth_external VALUES(?,?,?)').run(String(args.provider), String(args.subject), user.id);
+                        methodActivity('oidc', String(args.provider)+'\0'+String(args.subject), user.id, now, true);
                         audit(user.id, 'account.external_register', user.id, now);
                         return user;
                     });
@@ -1028,6 +1058,7 @@ if (!isMainThread && workerData?.authStore) {
                         if (db.prepare('SELECT id FROM auth_passkeys WHERE id=?').get(String(credential.id)))
                             error(409, 'credential_already_registered');
                         db.prepare('INSERT INTO auth_passkeys VALUES(?,?,?,?)').run(String(credential.id), user.id, JSON.stringify(credential), Number(credential.counter));
+                        methodActivity('passkey', String(credential.id), user.id, now, true);
                         user.version++;
                         save(user);
                         audit(user.id, 'passkey.added', user.id, now);
@@ -1094,7 +1125,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 }
                 case 'cases':
-                    value = db.prepare('SELECT data FROM auth_cases WHERE id>? ORDER BY id LIMIT ?').all(String(args.after), Number(args.limit)).map(row => JSON.parse(String(row.data)));
+                    value = db.prepare("SELECT data FROM auth_cases WHERE id>? AND json_extract(data,'$.action')!='restore-access' ORDER BY id LIMIT ?").all(String(args.after), Number(args.limit)).map(row => JSON.parse(String(row.data)));
                     break;
                 case 'approveCase':
                     value = transaction(() => {
@@ -1112,6 +1143,7 @@ if (!isMainThread && workerData?.authStore) {
                             expires: number;
                             targetVersion: number;
                         };
+                        if(item.action==='restore-access')error(400,'recovery_approval_required');
                         if (item.status !== 'pending' || item.expires <= now)
                             error(409, 'case_unavailable');
                         if (item.makerId === approver.id)
@@ -1134,6 +1166,7 @@ if (!isMainThread && workerData?.authStore) {
                             target!.totpCounter = -1;
                             db.prepare('DELETE FROM auth_recovery WHERE account_id=?').run(target!.id);
                             db.prepare('DELETE FROM auth_passkeys WHERE account_id=?').run(target!.id);
+                            db.prepare("DELETE FROM auth_method_activity WHERE kind='passkey' AND account_id=?").run(target!.id);
                         }
                         target!.roles = nextRoles;
                         target!.status = nextStatus;
@@ -1217,6 +1250,7 @@ if (!isMainThread && workerData?.authStore) {
                             if (db.prepare('SELECT id FROM auth_passkeys WHERE id=?').get(passkey.id))
                                 error(409, 'credential_already_registered');
                             db.prepare('INSERT INTO auth_passkeys VALUES(?,?,?,?)').run(passkey.id, user.id, JSON.stringify(passkey), passkey.counter);
+                        methodActivity('passkey', String(passkey.id), user.id, now, true);
                         }
                         db.prepare('DELETE FROM auth_waitlist WHERE id=?').run(user.id);
                         audit(actor.id, 'registration.approved', user.id, now, String(args.reason || ''));
@@ -1402,7 +1436,7 @@ if (!isMainThread && workerData?.authStore) {
                     });
                     break;
                 case 'users':
-                    value = db.prepare("SELECT data FROM auth_accounts WHERE id>? AND (?='' OR instr(email,?)>0) AND (?='' OR status=?) AND (?='' OR EXISTS(SELECT 1 FROM json_each(auth_accounts.data,'$.roles') WHERE value=?)) ORDER BY id LIMIT ?").all(String(args.after || ''), String(args.query || ''), String(args.query || ''), String(args.status || ''), String(args.status || ''), String(args.role || ''), String(args.role || ''), Number(args.limit)).map(row => decode(row));
+                    try { value = queryUsers(db, args as UserQuery); } catch { error(400, 'invalid_user_cursor_or_filter'); }
                     break;
                 case 'removeMethod':
                     value = transaction(() => {
@@ -1415,9 +1449,16 @@ if (!isMainThread && workerData?.authStore) {
                                 error(409, 'last_required_factor');
                             user.mfaPasskeys = user.mfaPasskeys.filter(id => id !== args.credentialId);
                         }
+                        if (!user.passwordHash && !user.totpSecret && user.mfaPasskeys?.length) {
+                            const keys = db.prepare('SELECT id FROM auth_passkeys WHERE account_id=?').all(user.id).map(row => String(row.id)).filter(id => id !== args.credentialId);
+                            const external = db.prepare('SELECT provider,subject FROM auth_external WHERE account_id=?').all(user.id).filter(row => row.provider !== args.provider || row.subject !== args.subject);
+                            if (!external.length && !keys.some(primary => user.mfaPasskeys!.some(factor => factor !== primary && keys.includes(factor))))
+                                error(409, 'last_sign_in_method');
+                        }
                         const removed = args.credentialId ? db.prepare('DELETE FROM auth_passkeys WHERE id=? AND account_id=?').run(String(args.credentialId), user.id) : db.prepare('DELETE FROM auth_external WHERE provider=? AND subject=? AND account_id=?').run(String(args.provider), String(args.subject), user.id);
                         if (removed.changes !== 1)
                             error(404, 'sign_in_method_not_found');
+                        db.prepare('DELETE FROM auth_method_activity WHERE kind=? AND method_id=? AND account_id=?').run(args.credentialId?'passkey':'oidc',args.credentialId?String(args.credentialId):String(args.provider)+'\0'+String(args.subject),user.id);
                         user.version++;
                         save(user);
                         db.prepare('DELETE FROM auth_sessions WHERE account_id=? AND hash<>?').run(user.id, String(args.hash));
@@ -1432,6 +1473,7 @@ if (!isMainThread && workerData?.authStore) {
                             error(404, 'case_not_found');
                         const item = JSON.parse(String(row!.data)) as {
                             accountId: string;
+                            action?:string;recovery?:{state:string};
                             status: string;
                             roles?: string[];
                             notes?: {
@@ -1444,10 +1486,11 @@ if (!isMainThread && workerData?.authStore) {
                         if (!target)
                             error(404, 'account_not_found');
                         authorizeCase(actor, target!, item.roles);
-                        if (item.status !== 'pending')
+                        if (item.status !== 'pending'&&!(item.action==='restore-access'&&item.status==='applied'&&['delivery','ready'].includes(item.recovery?.state??'')))
                             error(409, 'case_unavailable');
-                        if (args.close)
-                            item.status = 'closed';
+                        if (args.close){
+                            item.status = 'closed';if(item.action==='restore-access'&&item.recovery){item.recovery.state='cancelled';db.prepare('DELETE FROM auth_manual_recovery WHERE case_id=?').run(String(args.id));}
+                        }
                         else {
                             if ((item.notes?.length ?? 0) >= 20)
                                 error(409, 'case_note_limit');
@@ -1461,7 +1504,7 @@ if (!isMainThread && workerData?.authStore) {
                 case 'cleanup':
                     value = transaction(() => {
                         let remaining = Number(args.limit), removed = 0;
-                        for (const [table, predicate, params] of [['auth_sessions', 'expires<=? OR last_seen<=?', [now, now - options.sessionIdleMs]], ['auth_tokens', 'expires<=?', [now]], ['auth_flows', 'expires<=?', [now]], ['auth_signups', 'expires<=?', [now]], ['auth_second_factor_proofs', 'expires<=?', [now]], ['auth_trusted_devices', 'expires<=?', [now]], ['auth_factor_recovery', 'expires<=?', [now]], ['auth_email_codes', 'expires<=?', [now]], ['auth_email_changes', 'expires<=?', [now]], ['auth_invites', 'expires<=?', [now]], ['auth_attempts', 'expires<=?', [now]], ['auth_cases', "json_extract(data,'$.expires')<=?", [now - 2592000000]]] as [
+                        for (const [table, predicate, params] of [['auth_sessions', 'expires<=? OR last_seen<=?', [now, now - options.sessionIdleMs]], ['auth_tokens', 'expires<=?', [now]], ['auth_flows', 'expires<=?', [now]], ['auth_signups', 'expires<=?', [now]], ['auth_second_factor_proofs', 'expires<=?', [now]], ['auth_trusted_devices', 'expires<=?', [now]], ['auth_factor_recovery', 'expires<=?', [now]], ['auth_manual_recovery', 'expires<=?', [now]], ['auth_email_codes', 'expires<=?', [now]], ['auth_email_changes', 'expires<=?', [now]], ['auth_invites', 'expires<=?', [now]], ['auth_attempts', 'expires<=?', [now]], ['auth_abuse','expires<=?',[now]], ['auth_admin_operations','expires<=?',[now]], ['auth_cases', "json_extract(data,'$.expires')<=?", [now - 2592000000]]] as [
                             string,
                             string,
                             number[]
@@ -1568,6 +1611,26 @@ if (!isMainThread && workerData?.authStore) {
                         return true;
                     });
                     break;
+                case 'adminAddNote': {
+                    const actor = fresh(String(args.hash), now).user, target = account(String(args.accountId));
+                    if (!target) error(404, 'account_not_found');
+                    const granted = permissions(actor.roles);
+                    if (!granted.includes('*') && !granted.includes('auth.users.manage')) error(403, 'permission_denied');
+                    for (const permission of permissions(target!.roles)) if (!granted.includes('*') && !granted.includes(permission)) error(403, 'delegation_ceiling_exceeded');
+                    audit(actor.id, 'admin.note', target!.id, now, String(args.reason));
+                    value = true;
+                    break;
+                }
+                case 'adminReveal': {
+                    const actor = fresh(String(args.hash), now).user, target = account(String(args.accountId));
+                    if (!target) error(404, 'account_not_found');
+                    const granted = permissions(actor.roles);
+                    if (!granted.includes('*') && (!granted.includes('auth.users.read') || !granted.includes('auth.users.reveal'))) error(403, 'permission_denied');
+                    for (const permission of permissions(target!.roles)) if (!granted.includes('*') && !granted.includes(permission)) error(403, 'delegation_ceiling_exceeded');
+                    audit(actor.id, 'admin.identifier_revealed', target!.id, now, String(args.reason));
+                    value = { id: target!.id, email: target!.email };
+                    break;
+                }
                 case 'adminExport':
                     value = transaction(() => {
                         const actor = fresh(String(args.hash), now).user, target = account(String(args.accountId));
@@ -1640,7 +1703,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 }
                 case 'allSessions':
-                    value = db.prepare('SELECT s.id,s.account_id AS accountId,a.email,s.created,s.authenticated_at AS authenticatedAt,s.expires,s.last_seen AS lastSeen,s.device_label AS deviceLabel FROM auth_sessions s JOIN auth_accounts a ON a.id=s.account_id WHERE s.id>? AND s.expires>? AND s.last_seen>? ORDER BY s.id LIMIT ?').all(String(args.after), now, now - options.sessionIdleMs, Number(args.limit));
+                    value = db.prepare(`SELECT s.id,s.account_id AS accountId,a.email,s.created,s.authenticated_at AS authenticatedAt,s.expires,s.last_seen AS lastSeen,s.device_label AS deviceLabel FROM auth_sessions s JOIN auth_accounts a ON a.id=s.account_id WHERE s.id>? AND s.expires>? AND s.last_seen>? AND (?='' OR s.account_id=?) AND instr(lower(COALESCE(s.device_label,'')),lower(?))>0 AND s.created>=? AND s.created<=? ORDER BY s.id LIMIT ?`).all(String(args.after), now, now - options.sessionIdleMs, String(args.accountId), String(args.accountId), String(args.device), Number(args.createdFrom), Number(args.createdTo), Number(args.limit));
                     break;
                 case 'devices':
                     value = db.prepare('SELECT hash AS id,label,last_seen AS lastSeen FROM auth_devices WHERE account_id=? ORDER BY last_seen DESC LIMIT 20').all(String(args.accountId));

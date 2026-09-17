@@ -1,3 +1,6 @@
+import type { AdminAccountDelivery } from './admin-account-operations.ts';
+import { createEmailCopy } from './email-copy.ts';
+import type { EmailCopy, EmailTemplateKey } from './email-copy.ts';
 import type { ManualRecoveryDelivery } from './manual-recovery.ts';
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import type { SESv2ClientConfig } from '@aws-sdk/client-sesv2';
@@ -10,37 +13,43 @@ export interface TokenMessage {
     token: string;
     purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'invitation' | 'verify-email-change' | 'cancel-email-change';
     signal: AbortSignal;
+    locale?: string;
 }
 export interface EmailCodeMessage {
     email: string;
     flowId: string;
     code: string;
     signal: AbortSignal;
+    locale?: string;
 }
 export interface SignupCodeMessage {
     email: string;
     code: string;
     signal: AbortSignal;
+    locale?: string;
 }
 export interface FactorRecoveryMessage {
     email: string;
     verificationToken: string;
     cancelToken: string;
     signal: AbortSignal;
+    locale?: string;
 }
 export type TokenSender = (message: TokenMessage) => Promise<void>;
 export interface SecurityNotice {
     email: string;
     event: 'new-device' | 'password-changed' | 'email-changed' | 'registration-attempt';
     signal: AbortSignal;
+    locale?: string;
 }
 /** A callable sendToken adapter; notify carries no credential or arbitrary markup. */
 export interface EmailSender extends TokenSender {
     sendEmailCode(message: EmailCodeMessage): Promise<void>;
     sendSignupCode(message: SignupCodeMessage): Promise<void>;
     sendFactorRecovery(message: FactorRecoveryMessage): Promise<void>;
-    sendManualRecovery(message: ManualRecoveryDelivery): Promise<void>;
+    sendManualRecovery(message: ManualRecoveryDelivery & { locale?: string }): Promise<void>;
     notify(message: SecurityNotice): Promise<void>;
+    sendAccountAdministration(message: AdminAccountDelivery & { signal: AbortSignal; locale?: string }): Promise<void>;
     close(): void;
 }
 interface Delivery {
@@ -51,22 +60,25 @@ interface Delivery {
 interface SenderLocation {
     origin: string;
     authMount: string;
+    emailCopy?: EmailCopy;
 }
 const events = { 'registration-attempt': 'Someone tried to create an account with your email address. Your existing account was not changed.', 'new-device': 'A new device signed in to your account.', 'password-changed': 'Your account password changed.', 'email-changed': 'Your account email address changed.' } as const;
 function location(options: SenderLocation, development = false): {
     origin: string;
     mount: string;
+    emailCopy: EmailCopy;
 } {
     const origin = new URL(options.origin);
     if (origin.origin !== options.origin || origin.username || origin.password || !(origin.protocol === 'https:' || development && origin.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)))
         throw new Error('Sender requires a canonical HTTPS origin');
     if (!/^\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*$/.test(options.authMount) || options.authMount.length > 256)
         throw new Error('Sender requires an explicit auth mount');
-    return { origin: origin.origin, mount: options.authMount };
+    return { origin: origin.origin, mount: options.authMount, emailCopy: options.emailCopy ?? createEmailCopy() };
 }
 function sender(where: {
     origin: string;
     mount: string;
+    emailCopy: EmailCopy;
 }, deliver: (message: Delivery, signal: AbortSignal) => Promise<void>, cleanup = () => { }): EmailSender {
     let closed = false, active = 0;
     async function send(message: Delivery, signal: AbortSignal) {
@@ -94,48 +106,46 @@ function sender(where: {
             active--;
         }
     }
+    const notice = (email: string, key: EmailTemplateKey, values: Record<string,string>, signal: AbortSignal, locale?: string) => send({ email: normalizeEmail(email), ...where.emailCopy.render(key, values, locale) }, signal);
     const result: EmailSender = Object.assign(async (message: TokenMessage) => {
-        if (!message || !['verify-email', 'reset-password', 'cancel-deletion', 'invitation', 'verify-email-change', 'cancel-email-change'].includes(message.purpose) || typeof message.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.token))
-            throw new Error('Invalid token delivery');
-        const change = message.purpose === 'verify-email-change' || message.purpose === 'cancel-email-change';
-        const email = normalizeEmail(message.email), verify = message.purpose === 'verify-email', title = change ? (message.purpose === 'verify-email-change' ? 'Verify your new email address' : 'Cancel an email address change') : verify ? 'Verify your email address' : message.purpose === 'cancel-deletion' ? 'Cancel account deletion' : message.purpose === 'invitation' ? 'Create your invited account' : 'Reset your password', url = new URL(where.mount + (change ? '/' + message.purpose : verify ? '/verify' : message.purpose === 'cancel-deletion' ? '/cancel-deletion' : message.purpose === 'invitation' ? '/register' : '/reset'), where.origin);
-        url.searchParams.set('token', message.token);
-        await send({ email, subject: title, text: `${title} by opening this link:\n\n${url.href}\n\n${message.purpose === 'verify-email-change' ? 'Verification confirms the new address. The change only activates after the 24-hour cooldown.' : message.purpose === 'cancel-email-change' ? 'A change to your account email was requested. Use this cancellation link before completion if this was not you.' : message.purpose === 'cancel-deletion' ? 'Account deletion was requested. If you did not request this, use this link to cancel the deletion before the grace period ends.' : 'If you did not request this, ignore this email.'} Never share this link.` }, message.signal);
-    }, { async sendEmailCode(message: EmailCodeMessage) {
-            if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code) || typeof message.flowId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.flowId))
-                throw new Error('Invalid email code delivery');
-            const url = new URL(where.mount + '/email-code', where.origin);
-            url.searchParams.set('flowId', message.flowId);
-            await send({ email: normalizeEmail(message.email), subject: 'Your sign-in code', text: `Your sign-in code is: ${message.code}\n\nEnter it at ${url.href}\n\nIf you did not request this, ignore this email. Never share this code.` }, message.signal);
-        }, async sendSignupCode(message: SignupCodeMessage) {
-            if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code))
-                throw new Error('Invalid signup code delivery');
-            const url = new URL(where.mount + '/signup', where.origin);
-            await send({ email: normalizeEmail(message.email), subject: 'Verify your email address', text: `Your signup code is: ${message.code}\n\nEnter it in the browser where you started signing up at ${url.href}\n\nIf you did not request this, ignore this email. Never share this code.` }, message.signal);
-        }, async sendFactorRecovery(message: FactorRecoveryMessage) {
-            if (!message || !/^[A-Za-z0-9_-]{43}$/.test(message.verificationToken) || !/^[A-Za-z0-9_-]{43}$/.test(message.cancelToken))
-                throw new Error('Invalid factor recovery delivery');
-            const confirm = new URL(where.mount + '/recover-factor/confirm', where.origin), cancel = new URL(where.mount + '/recover-factor/cancel', where.origin);
-            confirm.searchParams.set('token', message.verificationToken);
-            cancel.searchParams.set('token', message.cancelToken);
-            await send({ email: normalizeEmail(message.email), subject: 'Second-factor recovery requested', text: `Someone requested recovery of your account second factor. Confirm in the browser where you started recovery:\n\n${confirm.href}\n\nConfirmation starts a 24-hour waiting period. After that period, return to the confirmation link to finish recovery and enroll a new second factor. Existing sessions will be revoked when recovery completes.\n\nIf this was not you, cancel the request before it completes:\n\n${cancel.href}\n\nNever share these links.` }, message.signal);
-        }, async sendManualRecovery(message: ManualRecoveryDelivery) {
-            if (!message || typeof message.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.token))
-                throw new Error('Invalid manual recovery delivery');
-            const email = normalizeEmail(message.email), oldEmail = normalizeEmail(message.oldEmail), url = new URL(where.mount + '/restore-access', where.origin);
-            url.searchParams.set('token', message.token);
-            await send({ email: oldEmail, subject: 'Manual account recovery approved', text: 'Two administrators approved a manual recovery request for your account. Completing recovery will replace your sign-in methods and revoke existing sessions. If you did not request this, contact the account operator immediately.' }, message.signal);
-            await send({ email, subject: 'Restore account access', text: `Two administrators approved your account recovery. Choose a new password and enroll a second factor at:\n\n${url.href}\n\nThis link expires in 30 minutes. Your existing sign-in methods and sessions will be revoked when recovery completes. Never share this link.` }, message.signal);
-        }, async notify(message: SecurityNotice) {
-            if (!message || !Object.hasOwn(events, message.event))
-                throw new Error('Invalid security notice');
-            await send({ email: normalizeEmail(message.email), subject: 'Account security notification', text: `${events[message.event]}\n\nReview your account at ${where.origin}${where.mount}/account. If this was not you, contact the account operator.` }, message.signal);
-        }, close() {
-            if (closed)
-                return;
-            closed = true;
-            cleanup();
-        } });
+        if (!message || !['verify-email', 'reset-password', 'cancel-deletion', 'invitation', 'verify-email-change', 'cancel-email-change'].includes(message.purpose) || typeof message.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.token)) throw new Error('Invalid token delivery');
+        const paths = { 'verify-email':'/verify', 'reset-password':'/reset', 'cancel-deletion':'/cancel-deletion', invitation:'/register', 'verify-email-change':'/verify-email-change', 'cancel-email-change':'/cancel-email-change' };
+        const url = new URL(where.mount + paths[message.purpose], where.origin); url.searchParams.set('token',message.token);
+        await notice(message.email,message.purpose,{link:url.href},message.signal,message.locale);
+    }, {
+        async sendEmailCode(message: EmailCodeMessage) {
+            if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code) || typeof message.flowId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.flowId)) throw new Error('Invalid email code delivery');
+            const url = new URL(where.mount + '/email-code',where.origin);url.searchParams.set('flowId',message.flowId);
+            await notice(message.email,'sign-in-code',{link:url.href,code:message.code},message.signal,message.locale);
+        },
+        async sendSignupCode(message: SignupCodeMessage) {
+            if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code)) throw new Error('Invalid signup code delivery');
+            await notice(message.email,'signup-code',{link:new URL(where.mount+'/signup',where.origin).href,code:message.code},message.signal,message.locale);
+        },
+        async sendFactorRecovery(message: FactorRecoveryMessage) {
+            if (!message || typeof message.verificationToken !== 'string' || typeof message.cancelToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.verificationToken) || !/^[A-Za-z0-9_-]{43}$/.test(message.cancelToken)) throw new Error('Invalid factor recovery delivery');
+            const url=new URL(where.mount+'/recover-factor/confirm',where.origin),cancel=new URL(where.mount+'/recover-factor/cancel',where.origin);
+            url.searchParams.set('token',message.verificationToken);cancel.searchParams.set('token',message.cancelToken);
+            await notice(message.email,'factor-recovery',{link:url.href,cancelLink:cancel.href},message.signal,message.locale);
+        },
+        async sendManualRecovery(message: ManualRecoveryDelivery & { locale?: string }) {
+            if (!message || typeof message.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.token)) throw new Error('Invalid manual recovery delivery');
+            const email=normalizeEmail(message.email),oldEmail=normalizeEmail(message.oldEmail),url=new URL(where.mount+'/restore-access',where.origin);url.searchParams.set('token',message.token);
+            await notice(oldEmail,'manual-recovery-warning',{},message.signal,message.locale);
+            await notice(email,'manual-recovery',{link:url.href},message.signal,message.locale);
+        },
+        async sendAccountAdministration(message: AdminAccountDelivery & { signal: AbortSignal; locale?: string }) {
+            if (!message || !['token','notice'].includes(message.kind)) throw new Error('Invalid account administration delivery');
+            if (message.kind === 'token') return result({ email: message.email, token: message.token, purpose: message.purpose, signal: message.signal, ...(message.locale ? { locale: message.locale } : {}) });
+            if (!['verify-email','force-password-reset','schedule-deletion','cancel-deletion','remove-passkey','remove-external','request-email-change','assign-roles','resend-verification'].includes(message.action)) throw new Error('Invalid administration notice');
+            await notice(message.email,('admin-'+message.action) as EmailTemplateKey,{link:where.origin+where.mount+'/account'},message.signal,message.locale);
+        },
+        async notify(message: SecurityNotice) {
+            if (!message || !Object.hasOwn(events,message.event)) throw new Error('Invalid security notice');
+            await notice(message.email,message.event,{link:where.origin+where.mount+'/account'},message.signal,message.locale);
+        },
+        close() { if (closed) return; closed=true; cleanup(); }
+    });
     return result;
 }
 export interface SesSenderOptions extends SenderLocation {

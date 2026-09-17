@@ -8,13 +8,18 @@ Resumable verification-first password/passkey signup (including waitlist approva
 
 Mandatory verification/TOTP enrollment, operator standard/hardened presets and explicit pinned configuration migration are implemented; hardened requires email and breach-screening adapters.
 
+## Additional implemented acceptance
+
+- Bounded localized email copy, durable progressive password backoff, trusted-client and signup-domain velocity budgets, optional fixed-origin Turnstile verification/widget, and pinned disposable-domain data.
+- Integrated maker/checker manual recovery, staged administrative account actions and audited identifier reveal/notes. Manual recovery is an operator process; public lost-everything intake and recovery contacts remain later scope.
+- Offline `auth-baseline` runs 17 synthetic checks; anonymous `verify-deployment` inspects headers/cookies without claiming provider readiness.
+- Local browser walkthrough exercised identifier-first password login, account page, admin dashboard, filtered directory and masked detail. It found and corrected the no-referrer/Origin form failure. This is not a complete WCAG 2.2 AA assessment.
+
 ## Remaining first-release acceptance
 
-- Localized email copy and browser/accessibility checks. Current UI semantic hooks support escaped operator catalogues; no complete non-English packs are bundled.
-- Progressive abuse backoff and deployment-level IP velocity controls. An optional pinned disposable-domain dataset is bundled.
-- Admin-side manual recovery queue integration, tracked with the admin spike. Public self-service lost-everything intake is explicitly later in the auth scope table; administrative approval is not automated identity proofing.
-- Broader deployment compliance, lifecycle delivery/retry contracts and operational monitoring. The anonymous verify-deployment command checks observed HTTP response headers/cookies without asserting live-provider readiness.
-- Full cross-package packed-install and CI evidence for the final commit, plus independent security and deployment/recovery assessment.
+- Complete accessibility assessment, browser/device WebAuthn coverage, deployment/soak/backup-recovery exercises and independent security review.
+- Operator wiring of sender monitoring and lifecycle delivery policy. Hooks and security notices are best-effort after commit, without a durable retry queue (signed webhooks/retries are later scope).
+- Final cross-package packed-install and CI evidence at the reviewed commits.
 
 Live Google/Apple/SES testing is explicitly deferred by the project owner and is not a blocker for local implementation. It remains unverified. Synthetic signed protocol tests do not establish vendor configuration or delivery readiness.
 

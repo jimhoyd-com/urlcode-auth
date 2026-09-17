@@ -1,3 +1,12 @@
+import {createAdminAccountOperations} from './admin-account-operations.ts';
+import type {AdminAccountService} from './admin-account-operations.ts';
+import {isIP} from 'node:net';
+import {abuseKey,normalizeAbusePolicy} from './abuse.ts';
+import type {AuthAbuseOptions,AuthAbusePolicy} from './abuse.ts';
+import { validateUserQuery } from './user-query.ts';
+import type { UserQuery } from './user-query.ts';
+import {validateRecoveryEvidence} from './manual-recovery.ts';
+import type {ManualRecoveryService,ManualRecoveryCase} from './manual-recovery.ts';
 import { isDisposableEmailDomain, disposableDomainsRevision } from './disposable-domains.ts';
 import type { FactorRecoveryService } from './factor-recovery.ts';
 import { randomBytes, randomInt, randomUUID, createHash, createHmac, createCipheriv, createDecipheriv, scrypt, pbkdf2, timingSafeEqual } from 'node:crypto';
@@ -10,6 +19,8 @@ import { AuthError, openAuthStore } from './auth-store.ts';
 import type { AuthRecord, SessionRecord } from './auth-store.ts';
 export { AuthError };
 export interface AuthUser {
+    /** Latest retained device/session observation; not complete historical activity. */
+    observedLastSeen?: number;
     id: string;
     email: string;
     emailVerified: boolean;
@@ -26,9 +37,11 @@ export interface AuthSecondFactor {
     browserHash: string;
 }
 export interface AuthSecurityPolicy {
+    abuse?: AuthAbusePolicy;
     allowPasskeySecondFactor?: true;
     trustedDeviceTtlMs?: number;
     allowEmailFactorRecovery?: true;
+    allowManualRecovery?: true;
     requireEmailVerification: boolean;
     requireMfa: boolean;
     deletionGraceMs: number;
@@ -108,11 +121,13 @@ export interface AuthHookStats {
     timedOut: number;
 }
 export interface AuthOptions {
+    abuse?: AuthAbuseOptions;
     blockDisposableEmails?: boolean;
     allowPasskeySecondFactor?: boolean;
     trustedDeviceTtlMs?: number;
     /** Explicit email fallback lowers MFA assurance; disabled by default. */
     allowEmailFactorRecovery?: boolean;
+    allowManualRecovery?: boolean;
     approveConfigurationChangeFrom?: string;
     configurationTag?: string;
     requireEmailVerification?: boolean;
@@ -161,7 +176,8 @@ export interface AuthPasskey {
 export interface AuthCase {
     id: string;
     accountId: string;
-    action: 'reset-factors' | 'lock' | 'unlock' | 'roles';
+    action: 'reset-factors' | 'lock' | 'unlock' | 'roles' | 'restore-access';
+    recovery?:ManualRecoveryCase['recovery'];
     roles?: string[];
     reason: string;
     makerId: string;
@@ -197,7 +213,9 @@ export interface SignupStart extends SignupState {
         email: string;
     };
 }
-export interface AuthService extends FactorRecoveryService {
+export interface AuthService extends FactorRecoveryService,ManualRecoveryService,AdminAccountService {
+    getAbusePolicy(): AuthAbusePolicy|undefined;
+    admitAuthRequest(input:{client:string|null;signupEmail?:string}):Promise<{challengeRequired:boolean}>;
     createSecondFactorProof(input: {
         browserHash: string;
         proof: PasskeyAuthProof;
@@ -274,13 +292,7 @@ export interface AuthService extends FactorRecoveryService {
     authenticate(token: string): Promise<AuthPrincipal | null>;
     logout(token: string): Promise<void>;
     revokeSessions(accountId: string): Promise<void>;
-    listUsers(options?: {
-        limit?: number;
-        after?: string;
-        query?: string;
-        status?: AuthUser['status'];
-        role?: string;
-    }): Promise<{
+    listUsers(options?: UserQuery): Promise<{
         users: AuthUser[];
         next?: string;
     }>;
@@ -450,7 +462,7 @@ export interface AuthService extends FactorRecoveryService {
     createCase(input: {
         actorToken: string;
         accountId: string;
-        action: AuthCase['action'];
+        action: Exclude<AuthCase['action'],'restore-access'>;
         roles?: string[];
         reason: string;
     }): Promise<AuthCase>;
@@ -490,6 +502,10 @@ export interface AuthService extends FactorRecoveryService {
         daily: AuthDailyMetric[];
     }>;
     listAllSessions(options?: {
+        accountId?: string;
+        device?: string;
+        createdFrom?: number;
+        createdTo?: number;
         limit?: number;
         after?: string;
     }): Promise<{
@@ -611,6 +627,8 @@ export interface AuthService extends FactorRecoveryService {
         sessionId: string;
         reason: string;
     }): Promise<void>;
+    adminAddNote(input: { actorToken: string; accountId: string; reason: string }): Promise<void>;
+    adminReveal(input: { actorToken: string; accountId: string; reason: string }): Promise<{ id: string; email: string }>;
     adminExport(input: {
         actorToken: string;
         accountId: string;
@@ -720,6 +738,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     const deletionGraceMs = options.deletionGraceMs ?? 604800000;
     if (!Number.isSafeInteger(deletionGraceMs) || deletionGraceMs < 86400000 || deletionGraceMs > 2592000000)
         fail(400, 'invalid_deletion_grace');
+    if(options.allowManualRecovery!==undefined&&typeof options.allowManualRecovery!=='boolean')fail(400,'invalid_manual_recovery_policy');
     if (options.allowEmailFactorRecovery !== undefined && typeof options.allowEmailFactorRecovery !== 'boolean')
         fail(400, 'invalid_factor_recovery_policy');
     if (options.allowPasskeySecondFactor !== undefined && typeof options.allowPasskeySecondFactor !== 'boolean')
@@ -727,7 +746,8 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     const trustedDeviceTtlMs = options.trustedDeviceTtlMs ?? 0;
     if (!Number.isSafeInteger(trustedDeviceTtlMs) || trustedDeviceTtlMs < 0 || trustedDeviceTtlMs > 2592000000 || trustedDeviceTtlMs > 0 && trustedDeviceTtlMs < 60000)
         fail(400, 'invalid_trusted_device_policy');
-    const securityPolicy: AuthSecurityPolicy = Object.freeze({ ...(options.allowPasskeySecondFactor ? { allowPasskeySecondFactor: true as const } : {}), ...(trustedDeviceTtlMs ? { trustedDeviceTtlMs } : {}), ...(options.allowEmailFactorRecovery === true ? { allowEmailFactorRecovery: true as const } : {}), requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
+    const abusePolicy=normalizeAbusePolicy(options.abuse);
+    const securityPolicy: AuthSecurityPolicy = Object.freeze({ ...(abusePolicy?{abuse:abusePolicy}:{}), ...(options.allowManualRecovery===true?{allowManualRecovery:true as const}:{}), ...(options.allowPasskeySecondFactor ? { allowPasskeySecondFactor: true as const } : {}), ...(trustedDeviceTtlMs ? { trustedDeviceTtlMs } : {}), ...(options.allowEmailFactorRecovery === true ? { allowEmailFactorRecovery: true as const } : {}), requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
     const supplied = options.encryptionKeys ?? (options.encryptionKey ? { legacy: options.encryptionKey } : {}), activeKey = options.activeEncryptionKey ?? 'legacy';
     const keys: Record<string, Buffer> = Object.create(null);
     if (Object.keys(supplied).length < 1 || Object.keys(supplied).length > 8)
@@ -961,15 +981,22 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     };
     const login = async (input: AuthCredentials, oldToken?: string) => {
         check();
-        const email = normalizeEmail(input.email), attemptKey = await attempt('login:' + email), user = await store.call<AuthRecord | null>('email', { email });
+        const email=normalizeEmail(input.email),backoffKey=abuseKey('password',email);
+        if(abusePolicy?.passwordBackoff&&await store.call('abuseBackoffCheck',{key:backoffKey,now:now()}))return fail(429,'auth_backoff');
+        try {
+        const attemptKey=await attempt('login:'+email),user=await store.call<AuthRecord|null>('email',{email});
         const verified = await verifyPassword(input.password, user?.passwordHash);
         if (!verified || !user || user.status !== 'active')
             return fail(401, 'invalid_credentials');
         const fact = factor(user, input, !oldToken), session = sessionFor(user.id, input.device), upgradedHash = !user.passwordHash.startsWith('scrypt-v1$') ? await hashPassword(input.password, false) : undefined;
         if (fact.trustedDeviceHash)
             session.value.authenticatedAt = 0;
-        const stored = await store.call<AuthRecord>('login', { accountId: user.id, version: user.version, passwordHash: user.passwordHash, ...(upgradedHash ? { upgradedHash } : {}), ...fact, session: session.value, attemptKey, ...(oldToken ? { oldHash: digest(oldToken) } : {}), now: now() });
+        const stored = await store.call<AuthRecord>('login', { accountId: user.id, version: user.version, passwordHash: user.passwordHash, ...(upgradedHash ? { upgradedHash } : {}), ...fact, session: session.value, attemptKey, ...(abusePolicy?.passwordBackoff?{abuseKey:backoffKey}:{}), ...(oldToken ? { oldHash: digest(oldToken) } : {}), now: now() });
         return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value), ...(stored.newDevice ? { newDevice: true } : {}) };
+        } catch(error) {
+            if(abusePolicy?.passwordBackoff&&error instanceof AuthError&&error.status===401)await store.call('abuseFailure',{key:backoffKey,now:now()});
+            throw error;
+        }
     };
     const pagination = (options: {
         limit?: number;
@@ -1027,6 +1054,16 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         return row!;
     };
     const service: AuthService = {
+        ...createAdminAccountOperations({store,check,now,roles,permittedEmail}),
+        getAbusePolicy:()=>abusePolicy?structuredClone(abusePolicy):undefined,
+        async admitAuthRequest(input){
+            check();const limits:{key:string;limit:number;windowMs:number;challengeAfter?:number}[]=[];
+            const needsClient=abusePolicy?.client||input.signupEmail!==undefined&&abusePolicy?.signupClient;
+            if(needsClient&&(typeof input.client!=='string'||!isIP(input.client)))return fail(503,'trusted_client_required');
+            if(abusePolicy?.client)limits.push({...abusePolicy.client,key:abuseKey('client',input.client!),...(abusePolicy.challengeAfter!==undefined?{challengeAfter:abusePolicy.challengeAfter}:{})});
+            if(input.signupEmail!==undefined){const email=permittedEmail(input.signupEmail),domain=email.slice(email.lastIndexOf('@')+1);if(abusePolicy?.signupClient)limits.push({...abusePolicy.signupClient,key:abuseKey('signup-client',input.client!)});if(abusePolicy?.signupDomain)limits.push({...abusePolicy.signupDomain,key:abuseKey('signup-domain',domain)});}
+            return limits.length?store.call<{challengeRequired:boolean}>('abuseAdmit',{limits,now:now()}):{challengeRequired:false};
+        },
         async createSecondFactorProof(input) {
             check();
             if (!securityPolicy.allowPasskeySecondFactor || typeof input.browserHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.browserHash))
@@ -1055,6 +1092,13 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(401, 'invalid_credentials'); return store.call('trustedDevices', { hash: digest(raw), now: now() }); },
         async revokeTrustedDevice(input) { if (!validToken(input.token))
             fail(401, 'invalid_credentials'); await store.call('revokeTrustedDevice', { hash: digest(input.token), deviceId: id(input.deviceId), now: now() }); },
+        getManualRecoveryEnabled:()=>securityPolicy.allowManualRecovery===true,
+        async createRecoveryCase(input){check();if(!securityPolicy.allowManualRecovery)fail(403,'manual_recovery_disabled');if(!validToken(input.actorToken))fail(401,'invalid_credentials');const why=reason(input.reason);if(!why.trim())fail(400,'invalid_case');let evidence;try{evidence=validateRecoveryEvidence(input.evidence);}catch{fail(400,'invalid_recovery_evidence');}return store.call<ManualRecoveryCase>('manualRecoveryCreate',{hash:digest(input.actorToken),accountId:id(input.accountId),email:permittedEmail(input.email),evidence,reason:why,id:randomUUID(),now:now()});},
+        async listRecoveryCases(options){check();const page=pagination(options),cases=await store.call<ManualRecoveryCase[]>('manualRecoveryList',{...page,now:now()});return {cases,...(cases.length===page.limit?{next:cases.at(-1)!.id}:{})};},
+        async approveRecoveryCase(input){check();if(!validToken(input.actorToken))fail(401,'invalid_credentials');const why=reason(input.reason);if(!why.trim())fail(400,'invalid_case');const raw=token(),result=await store.call<{case:ManualRecoveryCase;email:string;oldEmail:string}>('manualRecoveryApprove',{hash:digest(input.actorToken),id:id(input.caseId),reason:why,tokenHash:digest(raw),now:now()});return {...result,token:raw};},
+        async activateRecoveryCase(input){check();if(!validToken(input.actorToken)||!validToken(input.token))fail(401,'invalid_credentials');await store.call('manualRecoveryActivate',{hash:digest(input.actorToken),id:id(input.caseId),tokenHash:digest(input.token),now:now()});},
+        async cancelRecoveryCredential(input){check();if(!validToken(input.actorToken)||!validToken(input.token))fail(401,'invalid_credentials');await store.call('manualRecoveryCancel',{hash:digest(input.actorToken),id:id(input.caseId),tokenHash:digest(input.token),now:now()});},
+        async redeemRecoveryCase(input){check();if(!securityPolicy.allowManualRecovery)fail(403,'manual_recovery_disabled');if(!validToken(input.token))fail(401,'invalid_recovery');await store.call('manualRecoveryCheck',{tokenHash:digest(input.token),now:now()});await attempt('manual-recovery:'+digest(input.token));const passwordHash=await newPassword(input.password),raw=token(),timestamp=now(),value:SessionRecord={id:randomUUID(),hash:digest(raw),accountId:'',created:timestamp,authenticatedAt:timestamp,expires:timestamp+Math.min(ttl,1800000),recoveryEnrollment:1,primaryMethod:'recovery',mfaAuthenticatedAt:0,mfaVersion:0};const user=await store.call<AuthRecord>('manualRecoveryRedeem',{tokenHash:digest(input.token),passwordHash,session:value,now:timestamp});value.accountId=user.id;return {user:publicUser(user),token:raw,principal:principal(user,value)};},
         getFactorRecoveryEnabled: () => securityPolicy.allowEmailFactorRecovery === true,
         async beginFactorRecovery(input) { check(); if (!securityPolicy.allowEmailFactorRecovery)
             fail(403, 'factor_recovery_disabled'); if (!validToken(input.browserToken))
@@ -1177,11 +1221,12 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         async revokeSessions(accountId) { check(); await store.call('revoke', { accountId: id(accountId), now: now() }); },
         async listUsers(options) {
             check();
-            const page = pagination(options);
-            if (options?.query !== undefined && (typeof options.query !== 'string' || options.query.length > 254) || options?.status !== undefined && !['active', 'locked', 'pending-delete'].includes(options.status) || options?.role !== undefined && !Object.hasOwn(roles, options.role))
-                fail(400, 'invalid_filter');
-            const rows = await store.call<AuthRecord[]>('users', { ...page, query: options?.query ?? '', status: options?.status ?? '', role: options?.role ?? '' });
-            return { users: rows.map(publicUser), ...(rows.length === page.limit ? { next: rows.at(-1)!.id } : {}) };
+            if(options?.limit!==undefined&&(!Number.isInteger(options.limit)||options.limit<1||options.limit>100))fail(400,'invalid_page');
+            let filters: ReturnType<typeof validateUserQuery>;
+            try { filters = validateUserQuery(options); } catch { return fail(400, 'invalid_user_filter'); }
+            if (filters.role !== undefined && !Object.hasOwn(roles, filters.role)) fail(400, 'invalid_filter');
+            const result = await store.call<{ users: (AuthRecord & { observedLastSeen?: number })[]; next?: string }>('users', { ...filters });
+            return { users: result.users.map(user => ({ ...publicUser(user), ...(typeof user.observedLastSeen === 'number' ? { observedLastSeen: user.observedLastSeen } : {}) })), ...(result.next ? { next: result.next } : {}) };
         },
         async getUser(accountId) { check(); const row = await store.call<AuthRecord | null>('account', { id: id(accountId) }); return row ? publicUser(row) : null; }, getRoles: () => structuredClone(roles),
         async listDevices(accountId) {
@@ -1452,10 +1497,15 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         },
         async listAllSessions(options) {
             check();
+            const filters = options ?? {};
+            if (filters.accountId !== undefined) id(filters.accountId);
+            if (filters.device !== undefined && (typeof filters.device !== 'string' || filters.device.length > 128 || /[\x00-\x1f\x7f]/.test(filters.device))) fail(400, 'invalid_session_filter');
+            for (const value of [filters.createdFrom, filters.createdTo]) if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) fail(400, 'invalid_session_filter');
+            if (filters.createdFrom !== undefined && filters.createdTo !== undefined && filters.createdFrom > filters.createdTo) fail(400, 'invalid_session_filter');
             const page = pagination(options), sessions = await store.call<(AuthSession & {
                 accountId: string;
                 email: string;
-            })[]>('allSessions', { ...page, now: now() });
+            })[]>('allSessions', { ...page, accountId: filters.accountId ?? '', device: filters.device ?? '', createdFrom: filters.createdFrom ?? 0, createdTo: filters.createdTo ?? Number.MAX_SAFE_INTEGER, now: now() });
             return { sessions, ...(sessions.length === page.limit ? { next: sessions.at(-1)!.id } : {}) };
         },
         async importUsers(users) {
@@ -1607,6 +1657,18 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             if (!why.trim() || !validToken(input.actorToken))
                 fail(400, 'invalid_administration');
             await store.call('revokeSession', { hash: digest(input.actorToken), sessionId: id(input.sessionId), admin: true, reason: why, now: now() });
+        },
+        async adminAddNote(input) {
+            check();
+            if (!validToken(input.actorToken)) fail(401, 'invalid_session');
+            if (typeof input.reason !== 'string' || !input.reason.trim() || input.reason.length > 256 || /[\x00-\x1f\x7f]/.test(input.reason)) fail(400, 'invalid_reason');
+            await store.call('adminAddNote', { hash: digest(input.actorToken), accountId: id(input.accountId), reason: input.reason.trim(), now: now() });
+        },
+        async adminReveal(input) {
+            check();
+            if (!validToken(input.actorToken)) fail(401, 'invalid_session');
+            if (typeof input.reason !== 'string' || !input.reason.trim() || input.reason.length > 256 || /[\x00-\x1f\x7f]/.test(input.reason)) fail(400, 'invalid_reason');
+            return store.call<{id:string;email:string}>('adminReveal', { hash: digest(input.actorToken), accountId: id(input.accountId), reason: input.reason.trim(), now: now() });
         },
         async adminExport(input) {
             check();

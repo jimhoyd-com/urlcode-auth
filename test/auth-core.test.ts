@@ -1061,3 +1061,23 @@ test('independent passkey proof replaces a lost TOTP and works across OIDC and h
     assert.ok(actual.principal.authenticatedAt > 0);
     assert.ok(await service.rememberDevice({ token: actual.token }));
 });
+
+test('method removal preserves an independent primary and passkey factor combination', async t => {
+    const {service} = await setup(t, {allowPasskeySecondFactor:true});
+    const admin = await service.bootstrapAdmin({email:'method-admin@example.test',password});
+    const browserHash='4'.repeat(64), start=await service.beginSignup({email:'method-primary@example.test',browserHash}), binding={flowId:start.flowId,browserHash}, challenge='s'.repeat(43);
+    await service.setSignupPasskeyChallenge({...binding,challenge});
+    await service.setSignupPasskey({...binding,challenge,credential:{id:'primary-method',publicKey:'synthetic-primary-public',counter:0}});
+    const account=(await service.completeSignup(binding))!;
+    await service.addPasskey({actorToken:account.token,credential:{id:'factor-method',publicKey:'synthetic-factor-public',counter:0}});
+    await service.setPasskeySecondFactor({token:account.token,credentialId:'factor-method',enabled:true,secondFactor:await factorProof(service,'factor-method')});
+    await assert.rejects(service.removePasskey({token:account.token,credentialId:'primary-method'}),{code:'last_sign_in_method'});
+    const base={actorToken:admin.token,accountIds:[account.user.id],reason:'Reviewed method removal'};
+    await assert.rejects(service.stageAccountAdministration({...base,action:'remove-passkey',credentialId:'primary-method'}),{code:'last_sign_in_method'});
+    await service.linkExternal({actorToken:account.token,provider:'example',subject:'synthetic-subject'});
+    await service.removePasskey({token:account.token,credentialId:'primary-method'});
+    await assert.rejects(service.unlinkExternal({token:account.token,provider:'example',subject:'synthetic-subject'}),{code:'last_sign_in_method'});
+    const methods=await service.inspectAccountAuthentication({actorToken:admin.token,accountId:account.user.id,reason:'Review remaining methods'});
+    await assert.rejects(service.stageAccountAdministration({...base,action:'remove-external',externalId:methods.external[0]!.id}),{code:'last_sign_in_method'});
+    assert.ok(await service.getPasskey('factor-method'));
+});

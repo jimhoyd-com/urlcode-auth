@@ -1,4 +1,4 @@
-export interface DeploymentCheckOptions { origin: string; authMount: string; allowDevelopment?: boolean; }
+export interface DeploymentCheckOptions { origin: string; authMount: string; allowDevelopment?: boolean; allowTurnstile?: boolean; }
 export interface DeploymentCheckResult { passed: boolean; checks: { name: string; passed: boolean }[]; liveProviders: 'unverified'; }
 /** Anonymous, read-only checks. No credentials, redirects, mail sends or account mutations. */
 export async function verifyDeployment(options: DeploymentCheckOptions, transport: typeof fetch = fetch): Promise<DeploymentCheckResult> {
@@ -14,11 +14,13 @@ export async function verifyDeployment(options: DeploymentCheckOptions, transpor
             const add = (name: string, passed: boolean) => checks.push({ name: prefix + '.' + name, passed });
             add('status', response.status === expected);
             add('no-store', /(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get('cache-control') ?? ''));
-            add('no-referrer', response.headers.get('referrer-policy') === 'no-referrer');
+            add('private-referrer', ['no-referrer', 'strict-origin'].includes(response.headers.get('referrer-policy') ?? ''));
             add('nosniff', response.headers.get('x-content-type-options') === 'nosniff');
             const directives = (response.headers.get('content-security-policy') ?? '').split(';').map(item => item.trim().split(/\s+/)).filter(item => item[0]);
             const csp = new Map(directives.map(([name, ...values]) => [name!, values.join(' ')]));
-            add('content-security-policy', csp.size === directives.length && csp.get('default-src') === "'none'" && csp.get('base-uri') === "'none'" && csp.get('frame-ancestors') === "'none'" && csp.get('form-action') === "'self'" && !/unsafe-inline|unsafe-eval|https?:|\*/.test(csp.get('script-src') ?? ''));
+            const sources = (name: string) => (csp.get(name) ?? '').split(/\s+/).filter(Boolean);
+            const challengeSource = (source: string) => options.allowTurnstile === true && source === 'https://challenges.cloudflare.com';
+            add('content-security-policy', csp.size === directives.length && csp.get('default-src') === "'none'" && csp.get('base-uri') === "'none'" && csp.get('frame-ancestors') === "'none'" && csp.get('form-action') === "'self'" && sources('script-src').every(source => /^'nonce-[A-Za-z0-9+/]{16,}={0,2}'$/.test(source) || challengeSource(source)) && sources('frame-src').every(source => source === "'none'" || challengeSource(source)) && sources('connect-src').every(source => source === "'none'" || source === "'self'" || challengeSource(source)));
             const cookies = response.headers.getSetCookie();
             add('cookie-policy', cookies.every(cookie => {
                 const [pair, ...attributes] = cookie.split(';').map(value => value.trim());

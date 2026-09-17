@@ -52,3 +52,9 @@ test('deployment command checks a real mounted runtime without credentials or ac
     assert.equal(result.passed, true, JSON.stringify(result.checks));
     assert.equal((await service.dashboard()).users, 0);
 });
+
+test('deployment CSP accepts only explicitly approved fixed Turnstile origin', async () => {
+    const transport = (async (url: string | URL | Request) => { const values=headers(); values.set('content-security-policy', values.get('content-security-policy') + "; script-src 'nonce-12345678901234567890abcd' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com"); return new Response('',{status:String(url).endsWith('/login')?200:401,headers:values}); }) as typeof fetch;
+    assert.equal((await verifyDeployment(options,transport)).passed,false);
+    assert.equal((await verifyDeployment({...options,allowTurnstile:true},transport)).passed,true);
+});
