@@ -18,7 +18,7 @@ try{
  const packages=[];
  async function build(source,peers=[]){
   if(!values['skip-install'])run(npm,['ci','--ignore-scripts','--legacy-peer-deps',...offline],source);
-  if(peers.length)run(npm,['install','--no-save','--package-lock=false','--ignore-scripts','--legacy-peer-deps',...offline,...peers],source);
+  if(peers.length)run(npm,['install','--no-save','--package-lock=false','--ignore-scripts',...offline,...peers],source);
   run(npm,['run','typecheck'],source);run(npm,['run','build'],source);
   const packed=JSON.parse(run(npm,['pack','--ignore-scripts','--json','--pack-destination',output],source,true));if(packed.length!==1)throw new Error('Unexpected package output');
   const record=packed[0];packages.push({name:record.name,version:record.version,filename:record.filename,integrity:record.integrity,revision:run('git',['rev-parse','HEAD'],source,true)});return join(output,record.filename);
