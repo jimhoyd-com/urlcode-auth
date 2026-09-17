@@ -44,6 +44,11 @@ export interface StoreOptions {
     roles: Record<string, string[]>;
     defaultRole: string;
     sessionIdleMs: number;
+    securityPolicy: {
+        requireEmailVerification: boolean;
+        requireMfa: boolean;
+        deletionGraceMs: number;
+    };
     registration: {
         mode: string;
         allowed: string[];
@@ -156,10 +161,19 @@ if (!isMainThread && workerData?.authStore) {
     const decode = (row: Record<string, SQLOutputValue> | undefined): AuthRecord | null => row ? JSON.parse(String(row.data)) as AuthRecord : null;
     const account = (id: string) => decode(db.prepare('SELECT data FROM auth_accounts WHERE id=?').get(id));
     const save = (record: AuthRecord) => db.prepare('UPDATE auth_accounts SET data=?,status=?,administrator=? WHERE id=?').run(JSON.stringify(record), record.status, Number(admin(record.roles)), record.id);
-    const metric = (event: 'signup' | 'success' | 'failure', method: string, now: number, count = 1) => { const day = Math.floor(now / 86400000); if (!['password', 'passkey', 'oidc', 'email-code', 'unknown'].includes(method))
-        method = 'unknown'; db.prepare('DELETE FROM auth_daily_metrics WHERE day<?').run(day - 29); db.prepare('INSERT INTO auth_daily_metrics(day,method,event,count) VALUES(?,?,?,?) ON CONFLICT(day,method,event) DO UPDATE SET count=count+excluded.count').run(day, method, event, count); };
-    const audit = (actor: string, action: string, subject: string, now: number, reason = '') => { db.prepare('INSERT INTO auth_audit(actor,action,subject,created,reason) VALUES(?,?,?,?,?)').run(actor, action, subject, now, reason); db.prepare('DELETE FROM auth_audit WHERE id <= (SELECT max(id)-100000 FROM auth_audit)').run(); if (['account.register', 'admin.bootstrap', 'registration.approved', 'admin.account_created', 'account.external_register', 'accounts.imported'].includes(action))
-        metric('signup', action === 'account.external_register' ? 'oidc' : action === 'accounts.imported' ? 'unknown' : 'password', now, action === 'accounts.imported' ? Number(subject) : 1); };
+    const metric = (event: 'signup' | 'success' | 'failure', method: string, now: number, count = 1) => {
+        const day = Math.floor(now / 86400000);
+        if (!['password', 'passkey', 'oidc', 'email-code', 'unknown'].includes(method))
+            method = 'unknown';
+        db.prepare('DELETE FROM auth_daily_metrics WHERE day<?').run(day - 29);
+        db.prepare('INSERT INTO auth_daily_metrics(day,method,event,count) VALUES(?,?,?,?) ON CONFLICT(day,method,event) DO UPDATE SET count=count+excluded.count').run(day, method, event, count);
+    };
+    const audit = (actor: string, action: string, subject: string, now: number, reason = '') => {
+        db.prepare('INSERT INTO auth_audit(actor,action,subject,created,reason) VALUES(?,?,?,?,?)').run(actor, action, subject, now, reason);
+        db.prepare('DELETE FROM auth_audit WHERE id <= (SELECT max(id)-100000 FROM auth_audit)').run();
+        if (['account.register', 'admin.bootstrap', 'registration.approved', 'admin.account_created', 'account.external_register', 'accounts.imported'].includes(action))
+            metric('signup', action === 'account.external_register' ? 'oidc' : action === 'accounts.imported' ? 'unknown' : 'password', now, action === 'accounts.imported' ? Number(subject) : 1);
+    };
     const transaction = <T>(fn: () => T): T => {
         db.exec('BEGIN IMMEDIATE');
         try {
@@ -196,15 +210,20 @@ if (!isMainThread && workerData?.authStore) {
         }
         return user?.status === 'active' ? { user, session: found as unknown as SessionRecord } : null;
     };
-    const fresh = (hash: string, now: number) => {
+    const restricted = (user: AuthRecord) => options.securityPolicy.requireEmailVerification && !user.emailVerified || options.securityPolicy.requireMfa && !user.totpSecret;
+    const fresh = (hash: string, now: number, enrollment = false) => {
         const found = session(hash, now);
         if (found?.session.impersonatorId)
             error(403, 'impersonation_restricted');
         if (!found || now - found.session.authenticatedAt > 300000)
             error(401, 'fresh_authentication_required');
+        if (restricted(found!.user) && (!enrollment || options.securityPolicy.requireEmailVerification && !found!.user.emailVerified))
+            error(403, 'enrollment_required');
         return found!;
     };
     const authorizeCase = (actor: AuthRecord, target: AuthRecord, nextRoles?: string[]) => {
+        if (restricted(actor))
+            error(403, 'enrollment_required');
         if (target.status === 'pending-delete')
             error(409, 'account_pending_deletion');
         const p = permissions(actor.roles);
@@ -274,7 +293,7 @@ if (!isMainThread && workerData?.authStore) {
             db.exec('ALTER TABLE auth_waitlist ADD COLUMN profile TEXT;');
         if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'last_seen'))
             db.exec('ALTER TABLE auth_sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_sessions ADD COLUMN device_label TEXT;UPDATE auth_sessions SET last_seen=created;');
-        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration })).digest('hex');
+        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
         const previous = db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value;
         if (previous && previous !== configuration)
             error(503, 'auth_configuration_changed');
@@ -480,8 +499,11 @@ if (!isMainThread && workerData?.authStore) {
                         if (user.version !== token!.version)
                             error(400, 'invalid_token');
                         db.prepare('DELETE FROM auth_tokens WHERE hash=?').run(String(args.hash));
-                        if (args.purpose === 'verify-email')
+                        if (args.purpose === 'verify-email') {
                             user.emailVerified = true;
+                            if (options.securityPolicy.requireEmailVerification)
+                                db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
+                        }
                         else {
                             user.passwordHash = String(args.passwordHash);
                             db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
@@ -494,7 +516,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 case 'totpBegin':
                     value = transaction(() => {
-                        const { user } = fresh(String(args.hash), now);
+                        const { user } = fresh(String(args.hash), now, true);
                         if (user.totpSecret)
                             error(409, 'totp_already_enabled');
                         user.totpPending = String(args.secret);
@@ -507,7 +529,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 case 'totpConfirm':
                     value = transaction(() => {
-                        const { user } = fresh(String(args.hash), now);
+                        const { user } = fresh(String(args.hash), now, true);
                         if (user.version !== args.version || !user.totpPending || !user.totpPendingUntil || user.totpPendingUntil <= now)
                             error(400, 'invalid_totp_setup');
                         user.totpSecret = user.totpPending!;
@@ -928,6 +950,10 @@ if (!isMainThread && workerData?.authStore) {
                             error(400, 'invalid_code');
                         consumeFactor(user, args);
                         db.prepare('DELETE FROM auth_email_codes WHERE hash=?').run(String(args.hash));
+                        if (options.securityPolicy.requireEmailVerification && !user.emailVerified) {
+                            db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
+                            user.version++;
+                        }
                         user.emailVerified = true;
                         save(user);
                         const newDevice = addSession(args.session as unknown as SessionRecord);
@@ -960,14 +986,14 @@ if (!isMainThread && workerData?.authStore) {
                         if (admin(user.roles) && num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n) <= 1)
                             error(409, 'last_administrator_required');
                         user.status = 'pending-delete';
-                        user.deleteAfter = now + 604800000;
+                        user.deleteAfter = now + options.securityPolicy.deletionGraceMs;
                         user.version++;
                         save(user);
                         db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
                         db.prepare('DELETE FROM auth_tokens WHERE account_id=?').run(user.id);
                         db.prepare("INSERT INTO auth_tokens VALUES(?,?,'cancel-deletion',?,?)").run(String(args.cancelHash), user.id, user.deleteAfter, user.version);
                         audit(user.id, 'account.deletion_scheduled', user.id, now);
-                        return true;
+                        return { deleteAfter: user.deleteAfter };
                     });
                     break;
                 case 'cancelDeletion':
@@ -1186,29 +1212,37 @@ if (!isMainThread && workerData?.authStore) {
                     value = transaction(() => { metric('failure', String(args.method), now); return true; });
                     break;
                 case 'adminBulk':
-                    value = transaction(() => { const actor = fresh(String(args.hash), now).user, p = permissions(actor.roles), action = String(args.action); if (!p.includes('*') && !p.includes(action === 'revoke-sessions' ? 'auth.sessions.manage' : 'auth.users.manage'))
-                        error(403, 'permission_denied'); const targets = (args.accountIds as string[]).map(account); for (const target of targets) {
-                        if (!target)
-                            error(404, 'account_not_found');
-                        if (target!.id === actor.id)
-                            error(403, 'self_administration_denied');
-                        if (target!.status === 'pending-delete')
-                            error(409, 'account_pending_deletion');
-                        for (const permission of permissions(target!.roles))
-                            if (!p.includes('*') && !p.includes(permission))
-                                error(403, 'delegation_ceiling_exceeded');
-                    } if (action === 'lock') {
-                        const remaining = num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n) - targets.filter(target => target!.status === 'active' && admin(target!.roles)).length;
-                        if (remaining < 1 && targets.some(target => target!.status === 'active' && admin(target!.roles)))
-                            error(409, 'last_administrator_required');
-                    } for (const target of targets) {
-                        if (action !== 'revoke-sessions')
-                            target!.status = action === 'lock' ? 'locked' : 'active';
-                        target!.version++;
-                        save(target!);
-                        db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(target!.id);
-                        audit(actor.id, 'admin.bulk.' + action, target!.id, now, String(args.reason));
-                    } return { affected: targets.length }; });
+                    value = transaction(() => {
+                        const actor = fresh(String(args.hash), now).user, p = permissions(actor.roles), action = String(args.action);
+                        if (!p.includes('*') && !p.includes(action === 'revoke-sessions' ? 'auth.sessions.manage' : 'auth.users.manage'))
+                            error(403, 'permission_denied');
+                        const targets = (args.accountIds as string[]).map(account);
+                        for (const target of targets) {
+                            if (!target)
+                                error(404, 'account_not_found');
+                            if (target!.id === actor.id)
+                                error(403, 'self_administration_denied');
+                            if (target!.status === 'pending-delete')
+                                error(409, 'account_pending_deletion');
+                            for (const permission of permissions(target!.roles))
+                                if (!p.includes('*') && !p.includes(permission))
+                                    error(403, 'delegation_ceiling_exceeded');
+                        }
+                        if (action === 'lock') {
+                            const remaining = num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n) - targets.filter(target => target!.status === 'active' && admin(target!.roles)).length;
+                            if (remaining < 1 && targets.some(target => target!.status === 'active' && admin(target!.roles)))
+                                error(409, 'last_administrator_required');
+                        }
+                        for (const target of targets) {
+                            if (action !== 'revoke-sessions')
+                                target!.status = action === 'lock' ? 'locked' : 'active';
+                            target!.version++;
+                            save(target!);
+                            db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(target!.id);
+                            audit(actor.id, 'admin.bulk.' + action, target!.id, now, String(args.reason));
+                        }
+                        return { affected: targets.length };
+                    });
                     break;
                 case 'dashboard': {
                     const counts = db.prepare("SELECT count(*) AS users,coalesce(sum(status='active'),0) AS active,coalesce(sum(status='locked'),0) AS locked,coalesce(sum(status='pending-delete'),0) AS pendingDeletion FROM auth_accounts").get()!;

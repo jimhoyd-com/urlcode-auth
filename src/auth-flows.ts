@@ -26,20 +26,32 @@ export interface AuthFlowOptions {
 }
 const id = () => randomBytes(32).toString('base64url');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== 'object' || Array.isArray(value))
-    throw new AuthHttpError(400, 'Invalid authentication flow'); return value as Record<string, unknown>; }
-function checkBinding(data: Record<string, unknown>, binding: string | undefined): void { const expected = typeof data.browserHash === 'string' ? data.browserHash : ''; if (!binding || !/^[a-f0-9]{64}$/.test(expected) || !timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(hash(binding), 'hex')))
-    throw new AuthHttpError(403, 'Authentication flow belongs to another browser'); }
-function complex(request: ExtensionRequest): Record<string, unknown> { if (request.body.byteLength > 16384)
-    throw new AuthHttpError(413, 'Request body too large'); if (request.headers.get('content-type')?.split(';')[0] !== 'application/json')
-    throw new AuthHttpError(415, 'JSON required'); try {
-    return record(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(request.body)));
+function record(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        throw new AuthHttpError(400, 'Invalid authentication flow');
+    return value as Record<string, unknown>;
 }
-catch {
-    throw new AuthHttpError(400, 'Invalid authentication payload');
-} }
-function fresh(authenticatedAt: number): void { if (Date.now() - authenticatedAt > 300000)
-    throw new AuthHttpError(403, 'Confirm your identity first'); }
+function checkBinding(data: Record<string, unknown>, binding: string | undefined): void {
+    const expected = typeof data.browserHash === 'string' ? data.browserHash : '';
+    if (!binding || !/^[a-f0-9]{64}$/.test(expected) || !timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(hash(binding), 'hex')))
+        throw new AuthHttpError(403, 'Authentication flow belongs to another browser');
+}
+function complex(request: ExtensionRequest): Record<string, unknown> {
+    if (request.body.byteLength > 16384)
+        throw new AuthHttpError(413, 'Request body too large');
+    if (request.headers.get('content-type')?.split(';')[0] !== 'application/json')
+        throw new AuthHttpError(415, 'JSON required');
+    try {
+        return record(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(request.body)));
+    }
+    catch {
+        throw new AuthHttpError(400, 'Invalid authentication payload');
+    }
+}
+function fresh(authenticatedAt: number): void {
+    if (Date.now() - authenticatedAt > 300000)
+        throw new AuthHttpError(403, 'Confirm your identity first');
+}
 export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount: string, registration: boolean) {
     const service = options.service, providers = options.providers || {}, flowCookie = '__Host-urlcode-oidc';
     if (Object.keys(providers).length > 16 || Object.keys(providers).some(name => !/^[a-z][a-z0-9-]{0,31}$/.test(name)))
@@ -48,7 +60,7 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
         string,
         string
     ] => ['set-cookie', `${flowCookie}=${value}; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=${maxAge}`];
-    const finish = async (request: ExtensionRequest, result: AuthSessionResult): Promise<AuthHttpResponse> => { const headers = options.onSession ? await options.onSession(request, result) : []; return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token) }, [...http.sessionHeaders(result.token), cookie('', 0), ...headers]) : jsonResponse(303, { redirect: mount + '/account' }, [['location', mount + '/account'], ...http.sessionHeaders(result.token), cookie('', 0), ...headers]); };
+    const finish = async (request: ExtensionRequest, result: AuthSessionResult): Promise<AuthHttpResponse> => { const headers = options.onSession ? await options.onSession(request, result) : []; return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), cookie('', 0), ...headers]) : jsonResponse(303, { redirect: mount + '/account' }, [['location', mount + '/account'], ...http.sessionHeaders(result.token), cookie('', 0), ...headers]); };
     return {
         buttons(csrf: string, link = false, text: (value: string) => string = value => value): string { return Object.keys(providers).map(name => `<form method="post" action="${escapeHtml(mount + '/providers/' + name + (link ? '/link' : '/start'))}">${csrfField(csrf)}<button type="submit">${escapeHtml(text(link ? 'Link' : 'Sign in with'))} ${escapeHtml(name)}</button></form>`).join(''); },
         async handle(request: ExtensionRequest): Promise<AuthHttpResponse | undefined> {

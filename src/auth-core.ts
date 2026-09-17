@@ -17,7 +17,14 @@ export interface AuthUser {
     totpEnabled: boolean;
     profile?: RegistrationProfile;
 }
+export type AuthRestriction = 'verify-email' | 'enroll-mfa';
+export interface AuthSecurityPolicy {
+    requireEmailVerification: boolean;
+    requireMfa: boolean;
+    deletionGraceMs: number;
+}
 export interface AuthPrincipal {
+    restrictions?: AuthRestriction[];
     id: string;
     email: string;
     emailVerified: boolean;
@@ -91,6 +98,9 @@ export interface AuthHookStats {
     timedOut: number;
 }
 export interface AuthOptions {
+    requireEmailVerification?: boolean;
+    requireMfa?: boolean;
+    deletionGraceMs?: number;
     onLifecycle?: (event: AuthLifecycleEvent, context: {
         signal: AbortSignal;
     }) => void | Promise<void>;
@@ -313,6 +323,7 @@ export interface AuthService {
         recoveryCode?: string;
     }): Promise<{
         cancelToken: string;
+        deleteAfter: number;
     }>;
     cancelDeletion(token: string): Promise<void>;
     purgeDeleted(options?: {
@@ -397,6 +408,7 @@ export interface AuthService {
         token: string;
         profile: RegistrationInput;
     }): Promise<RegistrationProfile>;
+    getSecurityPolicy(): AuthSecurityPolicy;
     getHookStats(): AuthHookStats;
     getRegistrationSchema(): RegistrationOptions;
     getRegistrationMode(): 'open' | 'invite-only' | 'waitlist' | 'off';
@@ -592,6 +604,13 @@ async function verifyPassword(value: string, encoded: string | undefined): Promi
 }
 const basePublicUser = (user: AuthRecord): AuthUser => ({ id: user.id, email: user.email, emailVerified: user.emailVerified, status: user.status, roles: [...user.roles], created: user.created, totpEnabled: Boolean(user.totpSecret) });
 export async function createAuthService(options: AuthOptions): Promise<AuthService> {
+    for (const value of [options.requireEmailVerification, options.requireMfa])
+        if (value !== undefined && typeof value !== 'boolean')
+            fail(400, 'invalid_security_policy');
+    const deletionGraceMs = options.deletionGraceMs ?? 604800000;
+    if (!Number.isSafeInteger(deletionGraceMs) || deletionGraceMs < 86400000 || deletionGraceMs > 2592000000)
+        fail(400, 'invalid_deletion_grace');
+    const securityPolicy: AuthSecurityPolicy = Object.freeze({ requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
     const supplied = options.encryptionKeys ?? (options.encryptionKey ? { legacy: options.encryptionKey } : {}), activeKey = options.activeEncryptionKey ?? 'legacy';
     const keys: Record<string, Buffer> = Object.create(null);
     if (Object.keys(supplied).length < 1 || Object.keys(supplied).length > 8)
@@ -647,7 +666,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(503, 'invalid_clock');
         return value;
     };
-    const store = await openAuthStore({ database: options.database, roles, defaultRole, sessionIdleMs: idle, registration: { mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
+    const store = await openAuthStore({ database: options.database, roles, defaultRole, sessionIdleMs: idle, securityPolicy, registration: { mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
     let closed = false;
     const hookStats: AuthHookStats = { accepted: 0, dropped: 0, failed: 0, timedOut: 0 };
     const hookControllers = new Set<AbortController>();
@@ -710,7 +729,8 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         return hashPassword(value);
     };
     const perms = (names: string[]) => [...new Set(names.flatMap(name => roles[name] || []))];
-    const principal = (user: AuthRecord, session: SessionRecord): AuthPrincipal => ({ id: user.id, email: user.email, emailVerified: user.emailVerified, roles: [...user.roles], permissions: session.impersonatorId ? perms(user.roles).filter(p => p !== '*' && !p.startsWith('auth.') && !p.startsWith('admin.')) : perms(user.roles), ...(session.impersonatorId ? { impersonatorId: session.impersonatorId } : {}), sessionId: session.id, authenticatedAt: session.authenticatedAt });
+    const restrictions = (user: AuthRecord): AuthRestriction[] => [...(securityPolicy.requireEmailVerification && !user.emailVerified ? ['verify-email' as const] : []), ...(securityPolicy.requireMfa && !user.totpSecret ? ['enroll-mfa' as const] : [])];
+    const principal = (user: AuthRecord, session: SessionRecord): AuthPrincipal => { const pending = restrictions(user); return { id: user.id, email: user.email, emailVerified: user.emailVerified, roles: pending.length ? [] : [...user.roles], permissions: pending.length ? [] : session.impersonatorId ? perms(user.roles).filter(p => p !== '*' && !p.startsWith('auth.') && !p.startsWith('admin.')) : perms(user.roles), ...(pending.length ? { restrictions: pending } : {}), ...(session.impersonatorId ? { impersonatorId: session.impersonatorId } : {}), sessionId: session.id, authenticatedAt: session.authenticatedAt }; };
     const sessionFor = (accountId: string, device?: AuthDevice) => {
         if (device && (!validToken(device.id) || device.label !== undefined && (typeof device.label !== 'string' || device.label.length > 160 || /[\x00-\x1f\x7f]/.test(device.label))))
             fail(400, 'invalid_device');
@@ -735,7 +755,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             return fail(503, 'auth_secret_unavailable');
         }
     };
-    const lookupSession = async (raw: string, fresh = false) => {
+    const lookupSession = async (raw: string, fresh = false, enrollment = false) => {
         check();
         if (!validToken(raw))
             return fail(401, 'invalid_credentials');
@@ -749,6 +769,11 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(403, 'impersonation_restricted');
         if (fresh && now() - value.session.authenticatedAt > 300000)
             fail(401, 'fresh_authentication_required');
+        if (fresh) {
+            const pending = restrictions(value.user);
+            if (pending.length && (!enrollment || pending.includes('verify-email')))
+                fail(403, 'enrollment_required');
+        }
         return value;
     };
     const attempt = async (value: string) => { const attemptKey = createHash('sha256').update('urlcode-auth-attempt:' + value).digest('hex'); await store.call('attempt', { key: attemptKey, now: now() }); return attemptKey; };
@@ -918,9 +943,9 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             const passwordHash = await newPassword(input.password);
             return publicUser(await store.call<AuthRecord>('consumeToken', { hash: digest(input.token), purpose: 'reset-password', passwordHash, now: now() }));
         },
-        async beginTotp(raw) { const { user } = await lookupSession(raw, true); await attempt('totp:' + user.id); const secret = new Secret({ size: 20 }), totp = new TOTP({ issuer: 'URLCode', label: user.email, secret }); await store.call('totpBegin', { hash: digest(raw), secret: seal(secret.base32, 'totp:' + user.id), now: now() }); return { secret: secret.base32, otpauthUrl: totp.toString() }; },
+        async beginTotp(raw) { const { user } = await lookupSession(raw, true, true); await attempt('totp:' + user.id); const secret = new Secret({ size: 20 }), totp = new TOTP({ issuer: 'URLCode', label: user.email, secret }); await store.call('totpBegin', { hash: digest(raw), secret: seal(secret.base32, 'totp:' + user.id), now: now() }); return { secret: secret.base32, otpauthUrl: totp.toString() }; },
         async confirmTotp(input) {
-            const { user } = await lookupSession(input.token, true);
+            const { user } = await lookupSession(input.token, true, true);
             await attempt('totp:' + user.id);
             if (!user.totpPending)
                 fail(400, 'invalid_totp_setup');
@@ -1041,8 +1066,10 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             if (user.passwordHash && !await verifyPassword(input.password ?? '', user.passwordHash))
                 fail(401, 'invalid_credentials');
             const cancelToken = token();
-            await store.call('deleteAccount', { hash: digest(input.token), cancelHash: digest(cancelToken), version: user.version, ...factor(user, input), now: now() });
-            return { cancelToken };
+            const deleted = await store.call<{
+                deleteAfter: number;
+            }>('deleteAccount', { hash: digest(input.token), cancelHash: digest(cancelToken), version: user.version, ...factor(user, input), now: now() });
+            return { cancelToken, deleteAfter: deleted.deleteAfter };
         },
         async cancelDeletion(raw) {
             check();
@@ -1105,10 +1132,16 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             }>('impersonate', { hash: digest(input.actorToken), accountId: input.accountId, session: session.value, reason: why, now: now() });
             return { user: publicUser(result.user), token: session.raw, principal: principal(result.user, result.session) };
         },
-        async adminBulk(input) { check(); const why = reason(input.reason); if (!validToken(input.actorToken) || !why.trim() || !['lock', 'unlock', 'revoke-sessions'].includes(input.action) || !Array.isArray(input.accountIds) || input.accountIds.length < 1 || input.accountIds.length > 50 || new Set(input.accountIds).size !== input.accountIds.length)
-            fail(400, 'invalid_bulk_action'); const accountIds = input.accountIds.map(id); return store.call<{
-            affected: number;
-        }>('adminBulk', { hash: digest(input.actorToken), accountIds, action: input.action, reason: why, now: now() }); },
+        async adminBulk(input) {
+            check();
+            const why = reason(input.reason);
+            if (!validToken(input.actorToken) || !why.trim() || !['lock', 'unlock', 'revoke-sessions'].includes(input.action) || !Array.isArray(input.accountIds) || input.accountIds.length < 1 || input.accountIds.length > 50 || new Set(input.accountIds).size !== input.accountIds.length)
+                fail(400, 'invalid_bulk_action');
+            const accountIds = input.accountIds.map(id);
+            return store.call<{
+                affected: number;
+            }>('adminBulk', { hash: digest(input.actorToken), accountIds, action: input.action, reason: why, now: now() });
+        },
         async dashboard() {
             check();
             return store.call<{
@@ -1147,6 +1180,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         },
         async getProfile(raw) { const { user } = await lookupSession(raw, true); return profilePolicy.publicProfile(user.profile ?? { metadata: {} }); },
         async updateProfile(input) { const { user } = await lookupSession(input.token, true), profile = validateProfile(input.profile, user.profile); await store.call('updateProfile', { hash: digest(input.token), profile, version: user.version, now: now() }); return profilePolicy.publicProfile(profile); },
+        getSecurityPolicy: () => ({ ...securityPolicy }),
         getHookStats: () => ({ ...hookStats }),
         getRegistrationSchema: () => profilePolicy.publicSchema(),
         getRegistrationMode: () => mode,
@@ -1315,18 +1349,20 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
                 value.fill(0);
         },
     };
-    const withFailureMetric = async <T>(method: string, run: () => Promise<T>): Promise<T> => { try {
-        return await run();
-    }
-    catch (error) {
-        if (error instanceof AuthError && [400, 401, 429].includes(error.status)) {
-            try {
-                await store.call('signInFailure', { method, now: now() });
-            }
-            catch { /* Observability cannot change the authentication result. */ }
+    const withFailureMetric = async <T>(method: string, run: () => Promise<T>): Promise<T> => {
+        try {
+            return await run();
         }
-        throw error;
-    } };
+        catch (error) {
+            if (error instanceof AuthError && [400, 401, 429].includes(error.status)) {
+                try {
+                    await store.call('signInFailure', { method, now: now() });
+                }
+                catch { /* Observability cannot change the authentication result. */ }
+            }
+            throw error;
+        }
+    };
     const passwordLogin = service.login, externalLogin = service.issueSession, codeLogin = service.consumeEmailCode;
     service.login = input => withFailureMetric('password', () => passwordLogin(input));
     service.issueSession = (accountId, input) => withFailureMetric(input.method === 'passkey' ? 'passkey' : 'oidc', () => externalLogin(accountId, input));

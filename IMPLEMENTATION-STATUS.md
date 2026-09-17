@@ -6,7 +6,7 @@ Implemented and covered by automated tests: durable SQLite accounts; bounded scr
 
 ## Remaining first-release acceptance
 
-- Complete mandatory-MFA/verified-email enrollment flow and genuinely enforced standard/hardened presets. Do not infer these from optional policy hooks.
+- Explicit operator migration of pinned auth configuration (URLCode issue #65). Mandatory verification/TOTP enrollment and operator standard/hardened preset factories are implemented; hardened requires email and breach-screening adapters.
 - Trusted-device MFA exemptions and their revocation model, if retained after security review; current device recognition only supports notices.
 - Multi-step registration UX, complete translated copy/error/provider/notice coverage, and browser/accessibility checks.
 - Disposable-address policy data, progressive abuse backoff and deployment-level IP velocity controls.

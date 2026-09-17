@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, stat, writeFile, mkdir, symlink } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
-import {pathToFileURL} from 'node:url';
-import {authExtension} from '../src/auth.ts';
+import { pathToFileURL } from 'node:url';
+import { authExtension } from '../src/auth.ts';
 import { initAuthentication } from '../src/scaffold.ts';
 test('auth scaffold separates operator authority and creates independent private keys', async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'urlcode-scaffold-'));
@@ -34,10 +34,15 @@ test('auth scaffold separates operator authority and creates independent private
     assert.ok(service.includes("defaultRole: 'member'"));
     assert.ok(service.includes("roles: {member: [], admin: ['*']}"));
     assert.ok(!service.includes(encryption.toString('hex')));
-    await writeFile(output.operatorFile,service.replace("'@jimhoyd/urlcode-auth'",JSON.stringify(new URL('../src/auth-core.ts',import.meta.url).href)));
-    const {default:operator}=await import(pathToFileURL(output.operatorFile).href);
-    try{await authExtension({service:operator,csrfKey:csrf,projectSha256:'a'.repeat(64)}).activate({registration:'off'},{origin:'https://scaffold.example',target:'node',projectSha256:'a'.repeat(64),mounts:['/account']});assert.equal(operator.getRegistrationMode(),'off');}finally{await operator.close();}
-
+    await writeFile(output.operatorFile, service.replace("'@jimhoyd/urlcode-auth'", JSON.stringify(new URL('../src/auth-core.ts', import.meta.url).href)));
+    const { default: operator } = await import(pathToFileURL(output.operatorFile).href);
+    try {
+        await authExtension({ service: operator, csrfKey: csrf, projectSha256: 'a'.repeat(64) }).activate({ registration: 'off' }, { origin: 'https://scaffold.example', target: 'node', projectSha256: 'a'.repeat(64), mounts: ['/account'] });
+        assert.equal(operator.getRegistrationMode(), 'off');
+    }
+    finally {
+        await operator.close();
+    }
     const readme = await readFile(join(output.directory, 'README.md'), 'utf8');
     assert.ok(readme.includes('paste-reviewed-64-character-sha256'));
     assert.ok(readme.includes('--host-file'));

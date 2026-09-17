@@ -19,3 +19,7 @@ export { initAuthentication } from './scaffold.ts';
 export type { EmailSender, SesSenderOptions, DevelopmentSenderOptions } from './senders.ts';
 export { createPasswordBreachChecker } from './password-policy.ts';
 export type { PasswordBreachOptions } from './password-policy.ts';
+export type { AuthDailyMetric } from './auth-core.ts';
+export { createAuthPreset } from './presets.ts';
+export type { AuthPreset, AuthPresetOptions } from './presets.ts';
+export type { AuthRestriction, AuthSecurityPolicy } from './auth-core.ts';

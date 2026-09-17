@@ -87,3 +87,13 @@ Back up encryption keys, CSRF keys and reviewed static configuration separately.
 The host owns the shared service and sender lifecycle. Close them once after all extension runtimes stop. Scheduled purge/sweep operation and backups are operator responsibilities; opportunistic cleanup is not a retention policy.
 
 Apache-2.0. No package is published by these workflows.
+
+## Operator presets and enrollment
+
+`createAuthPreset({preset: 'standard', origin, rpName, sender?})` supplies passkeys, standard session limits and seven-day deletion grace. Without a sender it returns an explicit notice that email flows are unavailable. TOTP and recovery are service capabilities; remembered devices only trigger notices and never bypass factors.
+
+`createAuthPreset({preset: 'hardened', origin, rpName, sender, checkPassword: createPasswordBreachChecker()})` requires both adapters and supplies mandatory email verification followed by TOTP enrollment, shorter sessions and 30-day deletion grace. Spread `preset.service` into `createAuthService` and `preset.extension` into `authExtension`, together with your operator paths, keys and static project pin. Choosing the online breach checker makes password creation/reset depend on that external service; inject an approved local checker if needed. Deliberate overrides change the effective policy and should be reviewed.
+
+Restricted enrollment sessions can verify their email and enroll TOTP, but cannot authorize protected application routes or administration. Required verification revokes old sessions and requires a fresh sign-in before factor enrollment. Public routes without auth policies remain public. These controls do not establish independent security certification or live provider readiness.
+
+Configuration is currently database-pinned: changing registration modes, roles or security requirements on an existing database needs an explicit migration facility tracked in URLCode issue #65. Do not edit database metadata manually or assume changing YAML alone migrates authority.

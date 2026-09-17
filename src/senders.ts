@@ -65,8 +65,12 @@ function sender(where: {
         signal.addEventListener('abort', abort, { once: true });
         let rejectAbort: () => void = () => { };
         try {
-            await Promise.race([deliver(message, controller.signal), new Promise<never>((_resolve, reject) => { rejectAbort = () => reject(new Error('Email delivery aborted')); controller.signal.addEventListener('abort', rejectAbort, { once: true }); if (controller.signal.aborted)
-                    rejectAbort(); })]);
+            await Promise.race([deliver(message, controller.signal), new Promise<never>((_resolve, reject) => {
+                    rejectAbort = () => reject(new Error('Email delivery aborted'));
+                    controller.signal.addEventListener('abort', rejectAbort, { once: true });
+                    if (controller.signal.aborted)
+                        rejectAbort();
+                })]);
         }
         finally {
             clearTimeout(timer);
@@ -81,7 +85,7 @@ function sender(where: {
         const change = message.purpose === 'verify-email-change' || message.purpose === 'cancel-email-change';
         const email = normalizeEmail(message.email), verify = message.purpose === 'verify-email', title = change ? (message.purpose === 'verify-email-change' ? 'Verify your new email address' : 'Cancel an email address change') : verify ? 'Verify your email address' : message.purpose === 'cancel-deletion' ? 'Cancel account deletion' : message.purpose === 'invitation' ? 'Create your invited account' : 'Reset your password', url = new URL(where.mount + (change ? '/' + message.purpose : verify ? '/verify' : message.purpose === 'cancel-deletion' ? '/cancel-deletion' : message.purpose === 'invitation' ? '/register' : '/reset'), where.origin);
         url.searchParams.set('token', message.token);
-        await send({ email, subject: title, text: `${title} by opening this link:\n\n${url.href}\n\n${message.purpose === 'verify-email-change' ? 'Verification confirms the new address. The change only activates after the 24-hour cooldown.' : message.purpose === 'cancel-email-change' ? 'A change to your account email was requested. Use this cancellation link before completion if this was not you.' : 'If you did not request this, ignore this email.'} Never share this link.` }, message.signal);
+        await send({ email, subject: title, text: `${title} by opening this link:\n\n${url.href}\n\n${message.purpose === 'verify-email-change' ? 'Verification confirms the new address. The change only activates after the 24-hour cooldown.' : message.purpose === 'cancel-email-change' ? 'A change to your account email was requested. Use this cancellation link before completion if this was not you.' : message.purpose === 'cancel-deletion' ? 'Account deletion was requested. If you did not request this, use this link to cancel the deletion before the grace period ends.' : 'If you did not request this, ignore this email.'} Never share this link.` }, message.signal);
     }, { async sendEmailCode(message: EmailCodeMessage) {
             if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code) || typeof message.flowId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.flowId))
                 throw new Error('Invalid email code delivery');
@@ -92,8 +96,12 @@ function sender(where: {
             if (!message || !Object.hasOwn(events, message.event))
                 throw new Error('Invalid security notice');
             await send({ email: normalizeEmail(message.email), subject: 'Account security notification', text: `${events[message.event]}\n\nReview your account at ${where.origin}${where.mount}/account. If this was not you, contact the account operator.` }, message.signal);
-        }, close() { if (closed)
-            return; closed = true; cleanup(); } });
+        }, close() {
+            if (closed)
+                return;
+            closed = true;
+            cleanup();
+        } });
     return result;
 }
 export interface SesSenderOptions extends SenderLocation {

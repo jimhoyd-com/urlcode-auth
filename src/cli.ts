@@ -21,8 +21,11 @@ async function input(): Promise<Record<string, unknown>> {
         throw new Error('Invalid input');
     return value as Record<string, unknown>;
 }
-function string(value: unknown): string { if (typeof value !== 'string' || !value)
-    throw new Error('Required input missing'); return value; }
+function string(value: unknown): string {
+    if (typeof value !== 'string' || !value)
+        throw new Error('Required input missing');
+    return value;
+}
 let service: AuthService | undefined;
 try {
     const { values, positionals } = parseArgs({ allowPositionals: true, options: { 'operator-file': { type: 'string' }, directory: { type: 'string' }, help: { type: 'boolean' } } });
@@ -67,13 +70,18 @@ try {
             else if (command === 'cleanup')
                 output = await service.cleanup({ limit: 1000 });
             else if (command === 'doctor')
-                output = { database: 'ready', registration: service.getRegistrationMode(), accounts: (await service.dashboard()).users, liveProviders: 'unverified' };
+                output = { database: 'ready', registration: service.getRegistrationMode(), security: service.getSecurityPolicy(), accounts: (await service.dashboard()).users, liveProviders: 'unverified' };
             else if (command === 'import') {
                 if (!Array.isArray(data.users))
                     throw new Error('Users array required');
-                const users = data.users.map((user: unknown) => { if (!user || typeof user !== 'object' || Array.isArray(user))
-                    throw new Error('Invalid user'); const row = user as Record<string, unknown>; if (Object.keys(row).some(key => !['email', 'passwordHash', 'emailVerified'].includes(key)) || row.emailVerified !== undefined && typeof row.emailVerified !== 'boolean')
-                    throw new Error('Invalid user field'); return { email: string(row.email), passwordHash: string(row.passwordHash), ...(typeof row.emailVerified === 'boolean' ? { emailVerified: row.emailVerified } : {}) }; });
+                const users = data.users.map((user: unknown) => {
+                    if (!user || typeof user !== 'object' || Array.isArray(user))
+                        throw new Error('Invalid user');
+                    const row = user as Record<string, unknown>;
+                    if (Object.keys(row).some(key => !['email', 'passwordHash', 'emailVerified'].includes(key)) || row.emailVerified !== undefined && typeof row.emailVerified !== 'boolean')
+                        throw new Error('Invalid user field');
+                    return { email: string(row.email), passwordHash: string(row.passwordHash), ...(typeof row.emailVerified === 'boolean' ? { emailVerified: row.emailVerified } : {}) };
+                });
                 output = await service.importUsers(users);
             }
             else if (command === 'sessions')
