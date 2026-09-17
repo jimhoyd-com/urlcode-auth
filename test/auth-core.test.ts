@@ -1,0 +1,493 @@
+import type { TestContext } from 'node:test';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { TOTP } from 'otpauth';
+import { createAuthService, normalizeEmail } from '../src/auth-core.ts';
+import type { AuthOptions } from '../src/auth-core.ts';
+const key = Buffer.alloc(32, 7), roles = { user: ['content.read'], editor: ['content.read', 'content.write'], manager: ['content.read', 'auth.users.manage', 'auth.sessions.manage'], admin: ['*'] }, password = 'synthetic password phrase 123';
+async function setup(t: TestContext, extra: Partial<AuthOptions> = {}) { const directory = await mkdtemp(join(tmpdir(), 'urlcode-auth-')), database = join(directory, 'auth.sqlite'); let timestamp = 1800000000000; const options = { database, encryptionKey: key, roles, defaultRole: 'user', now: () => timestamp, ...extra }; const service = await createAuthService(options); t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); }); return { service, options, database, advance: (ms: number) => { timestamp += ms; }, now: () => timestamp }; }
+test('password accounts, unique normalization, opaque sessions and durable restart', async (t) => {
+    const { service, options, database } = await setup(t), registered = await service.register({ email: ' Alice@EXAMPLE.com ', password });
+    assert.equal(registered.user.email, 'alice@example.com');
+    assert.deepEqual(registered.user.roles, ['user']);
+    assert.equal((await service.authenticate(registered.token))?.id, registered.user.id);
+    assert.equal(await service.authenticate('invalid'), null);
+    await assert.rejects(service.register({ email: 'alice@example.com', password }), { code: 'registration_unavailable' });
+    await assert.rejects(service.login({ email: 'alice@example.com', password: 'incorrect phrase' }), { code: 'invalid_credentials' });
+    await assert.rejects(service.login({ email: 'unknown@example.com', password }), { code: 'invalid_credentials' });
+    const signed = await service.login({ email: 'alice@example.com', password });
+    assert.notEqual(signed.token, registered.token);
+    await service.logout(signed.token);
+    assert.equal(await service.authenticate(signed.token), null);
+    await service.close();
+    const reopened = await createAuthService(options);
+    try {
+        assert.equal((await reopened.authenticate(registered.token))?.email, 'alice@example.com');
+        await reopened.revokeSessions(registered.user.id);
+        assert.equal(await reopened.authenticate(registered.token), null);
+    }
+    finally {
+        await reopened.close();
+    }
+    assert.equal((await readFile(database)).includes(Buffer.from(password)), false);
+});
+test('verification and password-reset tokens are scoped, atomic single-use and revoke sessions without bypassing factors', async (t) => {
+    const { service } = await setup(t), user = await service.register({ email: 'test@example.com', password });
+    const verification = (await service.issueToken({ email: user.user.email, purpose: 'verify-email' })).token!;
+    const results = await Promise.allSettled([service.consumeVerification(verification), service.consumeVerification(verification)]);
+    assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+    assert.equal((await service.getUser(user.user.id))?.emailVerified, true);
+    const reset = (await service.issueToken({ email: user.user.email, purpose: 'reset-password' })).token!;
+    await assert.rejects(service.consumeVerification(reset), { code: 'invalid_token' });
+    await service.resetPassword({ token: reset, password: password + ' new' });
+    assert.equal(await service.authenticate(user.token), null);
+    await assert.rejects(service.resetPassword({ token: reset, password }), { code: 'invalid_token' });
+    assert.equal((await service.login({ email: user.user.email, password: password + ' new' })).user.id, user.user.id);
+    assert.equal((await service.issueToken({ email: 'unknown@example.com', purpose: 'reset-password' })).token, null);
+});
+test('TOTP secrets are encrypted, codes cannot replay and recovery codes are single-use', async (t) => {
+    const { service, database, advance, now } = await setup(t), user = await service.register({ email: 'mfa@example.com', password }), setupTotp = await service.beginTotp(user.token), otp = new TOTP({ secret: setupTotp.secret });
+    const codes = await service.confirmTotp({ token: user.token, code: otp.generate({ timestamp: now() }) });
+    assert.equal(codes.recoveryCodes.length, 10);
+    await assert.rejects(service.login({ email: user.user.email, password }), { code: 'invalid_credentials' });
+    advance(30000);
+    const current = otp.generate({ timestamp: now() });
+    await service.login({ email: user.user.email, password, totp: current });
+    await assert.rejects(service.login({ email: user.user.email, password, totp: current }), { code: 'invalid_credentials' });
+    await service.login({ email: user.user.email, password, recoveryCode: codes.recoveryCodes[0]! });
+    await assert.rejects(service.login({ email: user.user.email, password, recoveryCode: codes.recoveryCodes[0]! }), { code: 'invalid_credentials' });
+    const reset = (await service.issueToken({ email: user.user.email, purpose: 'reset-password' })).token!;
+    await service.resetPassword({ token: reset, password: password + ' changed' });
+    await assert.rejects(service.login({ email: user.user.email, password: password + ' changed' }), { code: 'invalid_credentials' });
+    await service.close();
+    const bytes = await readFile(database);
+    assert.equal(bytes.includes(Buffer.from(setupTotp.secret)), false);
+    assert.equal(bytes.includes(Buffer.from(codes.recoveryCodes[0]!)), false);
+});
+test('administrative mutations are fresh, audited, forbid self escalation and enforce delegation ceilings', async (t) => {
+    const { service, advance } = await setup(t), admin = await service.bootstrapAdmin({ email: 'admin@example.com', password }), ordinary = await service.register({ email: 'user@example.com', password });
+    await assert.rejects(service.bootstrapAdmin({ email: 'other-admin@example.com', password }), { code: 'bootstrap_unavailable' });
+    await assert.rejects(service.adminSetRoles({ actorToken: ordinary.token, accountId: ordinary.user.id, roles: ['admin'] }), { code: 'permission_denied' });
+    await assert.rejects(service.adminSetRoles({ actorToken: admin.token, accountId: admin.user.id, roles: ['user'] }), { code: 'self_administration_denied' });
+    await service.adminSetRoles({ actorToken: admin.token, accountId: ordinary.user.id, roles: ['manager'], reason: 'delegate support' });
+    assert.equal(await service.authenticate(ordinary.token), null);
+    const manager = await service.login({ email: ordinary.user.email, password });
+    await assert.rejects(service.adminSetStatus({ actorToken: manager.token, accountId: admin.user.id, status: 'locked' }), { code: 'delegation_ceiling_exceeded' });
+    const other = await service.register({ email: 'other@example.com', password });
+    await assert.rejects(service.adminSetRoles({ actorToken: manager.token, accountId: other.user.id, roles: ['admin'] }), { code: 'delegation_ceiling_exceeded' });
+    await service.adminRevokeSessions({ actorToken: admin.token, accountId: other.user.id, reason: 'security event' });
+    assert.equal(await service.authenticate(other.token), null);
+    assert.ok((await service.listAudit()).events.some(event => event.reason === 'security event'));
+    advance(300001);
+    await assert.rejects(service.adminSetStatus({ actorToken: admin.token, accountId: other.user.id, status: 'locked' }), { code: 'fresh_authentication_required' });
+    const refreshed = await service.stepUp({ token: admin.token, password });
+    assert.equal(await service.authenticate(admin.token), null);
+    await service.adminSetStatus({ actorToken: refreshed.token, accountId: other.user.id, status: 'locked' });
+    await assert.rejects(service.login({ email: other.user.email, password }), { code: 'invalid_credentials' });
+});
+test('authentication resource bounds, expiration, pagination and configuration identity fail closed', async (t) => {
+    const { service, options, advance } = await setup(t);
+    await assert.rejects(service.register({ email: 'x@example.com', password: 'short' }), { code: 'password_length_invalid' });
+    await assert.rejects(service.listUsers({ limit: 101 }), { code: 'invalid_page' });
+    const user = await service.register({ email: 'expire@example.com', password });
+    advance(86400001);
+    assert.equal(await service.authenticate(user.token), null);
+    await service.close();
+    await assert.rejects(createAuthService({ ...options, encryptionKey: Buffer.alloc(32, 8) }), { code: 'auth_configuration_changed' });
+    assert.equal(normalizeEmail('A+tag@EXAMPLE.com'), 'a+tag@example.com');
+});
+test('encrypted flows are expiring and single-use, identities never auto-link and passkey counters compare atomically', async (t) => {
+    const { service, now, advance } = await setup(t);
+    await service.putFlow({ id: 'flow-1', kind: 'oidc', data: { verifier: 'synthetic-verifier', browserHash: 'binding' }, expires: now() + 60000 });
+    const results = await Promise.all([service.consumeFlow('flow-1', 'oidc'), service.consumeFlow('flow-1', 'oidc')]);
+    assert.equal(results.filter(Boolean).length, 1);
+    await service.putFlow({ id: 'flow-2', kind: 'oidc', data: {}, expires: now() + 1000 });
+    advance(1001);
+    assert.equal(await service.consumeFlow('flow-2', 'oidc'), null);
+    const user = await service.register({ email: 'link@example.com', password });
+    await assert.rejects(service.createExternalAccount({ email: user.user.email, provider: 'google', subject: 'sub-1', emailVerified: true }), { code: 'explicit_identity_link_required' });
+    await service.linkExternal({ actorToken: user.token, provider: 'google', subject: 'sub-1' });
+    assert.equal((await service.findExternal('google', 'sub-1'))?.id, user.user.id);
+    const external = await service.createExternalAccount({ email: 'external@example.com', provider: 'google', subject: 'sub-2', emailVerified: true });
+    await assert.rejects(service.login({ email: external.email, password }), { code: 'invalid_credentials' });
+    assert.equal((await service.issueSession(external.id, { method: 'oidc', proof: (await service.getExternalProof('google', 'sub-2'))!.proof })).principal.id, external.id);
+    await service.addPasskey({ actorToken: user.token, credential: { id: 'credential-1', publicKey: 'public-base64url', counter: 1 } });
+    const changed = await Promise.allSettled([service.advancePasskeyCounter({ id: 'credential-1', expectedCounter: 1, newCounter: 2 }), service.advancePasskeyCounter({ id: 'credential-1', expectedCounter: 1, newCounter: 2 })]);
+    assert.equal(changed.filter(r => r.status === 'fulfilled').length, 1);
+    assert.equal((await service.getPasskey('credential-1'))?.credential.counter, 2);
+    assert.equal((await service.getPasskey('credential-1'))?.accountId, user.user.id);
+});
+test('account lifecycle exports no credentials, changes passwords with revocation and protects the last admin on deletion', async (t) => {
+    const { service, advance } = await setup(t), admin = await service.bootstrapAdmin({ email: 'owner@example.com', password }), user = await service.register({ email: 'lifecycle@example.com', password });
+    const exported = await service.exportAccount(user.token);
+    assert.equal(exported.user.id, user.user.id);
+    assert.equal(JSON.stringify(exported).includes('passwordHash'), false);
+    await assert.rejects(service.deleteAccount({ token: admin.token, password }), { code: 'last_administrator_required' });
+    await assert.rejects(service.changePassword({ token: user.token, currentPassword: 'incorrect', password: password + ' new' }), { code: 'invalid_credentials' });
+    await service.changePassword({ token: user.token, currentPassword: password, password: password + ' new' });
+    assert.equal(await service.authenticate(user.token), null);
+    const changed = await service.login({ email: user.user.email, password: password + ' new' });
+    const scheduled = await service.deleteAccount({ token: changed.token, password: password + ' new' });
+    assert.equal((await service.getUser(user.user.id))?.status, 'pending-delete');
+    assert.deepEqual(await service.purgeDeleted(), { purged: 0 });
+    await service.cancelDeletion(scheduled.cancelToken);
+    await assert.rejects(service.cancelDeletion(scheduled.cancelToken), { code: 'invalid_token' });
+    const restored = await service.login({ email: user.user.email, password: password + ' new' });
+    await service.deleteAccount({ token: restored.token, password: password + ' new' });
+    advance(604800001);
+    assert.deepEqual(await service.purgeDeleted(), { purged: 1 });
+    assert.equal(await service.getUser(user.user.id), null);
+    assert.equal(await service.authenticate(changed.token), null);
+    assert.ok((await service.listAudit()).events.some(e => e.action === 'account.deleted'));
+});
+test('email-code authentication is atomic single use and cannot bypass enabled TOTP', async (t) => {
+    const { service, now } = await setup(t), user = await service.register({ email: 'emailcode@example.com', password });
+    const code = await service.issueEmailCode({ email: user.user.email });
+    const outcomes = await Promise.allSettled([service.consumeEmailCode({ flowId: code.flowId, code: code.code! }), service.consumeEmailCode({ flowId: code.flowId, code: code.code! })]);
+    assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1);
+    const setupTotp = await service.beginTotp(user.token);
+    const recovery = await service.confirmTotp({ token: user.token, code: new TOTP({ secret: setupTotp.secret }).generate({ timestamp: now() }) });
+    const withMfa = await service.issueEmailCode({ email: user.user.email });
+    await assert.rejects(service.consumeEmailCode({ flowId: withMfa.flowId, code: withMfa.code! }), { code: 'invalid_credentials' });
+    assert.equal((await service.consumeEmailCode({ flowId: withMfa.flowId, code: withMfa.code!, recoveryCode: recovery.recoveryCodes[0]! })).principal.id, user.user.id);
+});
+test('keyring rotation migrates encrypted records, rejects stale writers and permits retired-key removal', async (t) => {
+    const { service, options, now } = await setup(t), user = await service.register({ email: 'rotation@example.com', password });
+    const totp = await service.beginTotp(user.token);
+    await service.putFlow({ id: 'rotation-flow', kind: 'oidc', data: { verifier: 'sensitive' }, expires: now() + 60000 });
+    const nextKey = Buffer.alloc(32, 9), rotating = await createAuthService({ ...options, encryptionKeys: { legacy: key, next: nextKey }, activeEncryptionKey: 'next' });
+    try {
+        await assert.rejects(service.beginTotp(user.token), { code: 'stale_encryption_key' });
+        await assert.rejects(createAuthService(options), { code: 'auth_store_unavailable' });
+        assert.deepEqual(await rotating.rotateEncryptionKey(), { changed: 2, remaining: 0 });
+    }
+    finally {
+        await rotating.close();
+        await service.close();
+    }
+    const reopened = await createAuthService({ ...options, encryptionKeys: { next: nextKey }, activeEncryptionKey: 'next' });
+    try {
+        assert.deepEqual(await reopened.consumeFlow('rotation-flow', 'oidc'), { verifier: 'sensitive' });
+        const recovery = await reopened.confirmTotp({ token: user.token, code: new TOTP({ secret: totp.secret }).generate({ timestamp: now() }) });
+        assert.equal(recovery.recoveryCodes.length, 10);
+    }
+    finally {
+        await reopened.close();
+    }
+});
+test('invite-only registration binds single-use invites to email and enforces operator domain restrictions', async (t) => {
+    const { service } = await setup(t, { registrationMode: 'invite-only', allowedEmailDomains: ['example.com'], blockedEmailDomains: ['blocked.example.com'] });
+    const admin = await service.bootstrapAdmin({ email: 'owner@example.com', password });
+    await assert.rejects(service.register({ email: 'invited@example.com', password }), { code: 'registration_unavailable' });
+    const invite = await service.invite({ actorToken: admin.token, email: 'invited@example.com' });
+    await assert.rejects(service.register({ email: 'different@example.com', password, invitationToken: invite.token }), { code: 'registration_unavailable' });
+    const user = await service.register({ email: 'invited@example.com', password, invitationToken: invite.token });
+    assert.deepEqual(user.user.roles, ['user']);
+    await assert.rejects(service.invite({ actorToken: admin.token, email: 'x@other.example' }), { code: 'registration_unavailable' });
+    await assert.rejects(service.register({ email: 'invited@example.com', password, invitationToken: invite.token }), { code: 'registration_unavailable' });
+});
+test('waitlist approval needs fresh administrative authority and creates an ordinary account without issuing a session', async (t) => {
+    const { service } = await setup(t, { registrationMode: 'waitlist' }), admin = await service.bootstrapAdmin({ email: 'owner@example.com', password });
+    await assert.rejects(service.register({ email: 'waiting@example.com', password }), { code: 'registration_unavailable' });
+    const request = await service.requestRegistration({ email: 'waiting@example.com', password });
+    assert.equal((await service.listRegistrationRequests()).requests[0]?.id, request.id);
+    await assert.rejects(service.login({ email: 'waiting@example.com', password }), { code: 'invalid_credentials' });
+    const approved = await service.approveRegistration({ actorToken: admin.token, requestId: request.id, reason: 'approved applicant' });
+    assert.deepEqual(approved.roles, ['user']);
+    assert.equal((await service.listSessions(approved.id)).length, 0);
+    assert.equal((await service.login({ email: 'waiting@example.com', password })).user.id, approved.id);
+    assert.equal((await service.listRegistrationRequests()).requests.length, 0);
+});
+test('bounded admin overview filters and global session pages agree with account state', async (t) => {
+    const { service } = await setup(t), admin = await service.bootstrapAdmin({ email: 'owner@example.com', password }), user = await service.register({ email: 'searchable@example.com', password });
+    assert.equal((await service.listUsers({ query: 'searchable', role: 'user', status: 'active' })).users[0]?.id, user.user.id);
+    assert.equal((await service.listUsers({ query: 'missing' })).users.length, 0);
+    assert.equal((await service.dashboard()).users, 2);
+    assert.equal((await service.listAllSessions({ limit: 1 })).sessions.length, 1);
+    await service.adminSetStatus({ actorToken: admin.token, accountId: user.user.id, status: 'locked' });
+    assert.equal((await service.dashboard()).locked, 1);
+    assert.equal((await service.dashboard()).sessions, 1);
+});
+test('generic hash import is atomic, bounded and upgrades bcrypt and PBKDF2 on successful authentication', async (t) => {
+    const { service, database } = await setup(t);
+    const { hash } = await import('bcryptjs');
+    const { pbkdf2Sync } = await import('node:crypto');
+    const legacy = 'legacy-short', bcrypt = await hash(legacy, 10), salt = Buffer.alloc(16, 4), pb = 'pbkdf2-sha256$600000$' + salt.toString('base64url') + '$' + pbkdf2Sync(password, salt, 600000, 32, 'sha256').toString('base64url');
+    await assert.rejects(service.importUsers([{ email: 'same@example.com', passwordHash: bcrypt }, { email: 'SAME@example.com', passwordHash: pb }]), { code: 'import_collision' });
+    assert.equal((await service.listUsers()).users.length, 0);
+    assert.deepEqual(await service.importUsers([{ email: 'bcrypt@example.com', passwordHash: bcrypt }, { email: 'pbkdf@example.com', passwordHash: pb }]), { imported: 2 });
+    await assert.rejects(service.importUsers([{ email: 'bad@example.com', passwordHash: '$2b$31$' + '.'.repeat(53) }]), { code: 'invalid_import' });
+    await service.login({ email: 'bcrypt@example.com', password: legacy });
+    await service.login({ email: 'pbkdf@example.com', password });
+    await service.close();
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(database);
+    try {
+        for (const row of db.prepare('SELECT data FROM auth_accounts').all())
+            assert.ok(JSON.parse(String(row.data)).passwordHash.startsWith('scrypt-v1$'));
+    }
+    finally {
+        db.close();
+    }
+});
+test('recovery cases require distinct current administrators and pin the target version', async (t) => {
+    const { service, now } = await setup(t), admin = await service.bootstrapAdmin({ email: 'maker@example.com', password }), second = await service.register({ email: 'approver@example.com', password }), target = await service.register({ email: 'case-target@example.com', password });
+    await service.adminSetRoles({ actorToken: admin.token, accountId: second.user.id, roles: ['admin'] });
+    const approver = await service.login({ email: second.user.email, password });
+    const totp = await service.beginTotp(target.token);
+    await service.confirmTotp({ token: target.token, code: new TOTP({ secret: totp.secret }).generate({ timestamp: now() }) });
+    const item = await service.createCase({ actorToken: admin.token, accountId: target.user.id, action: 'reset-factors', reason: 'verified recovery evidence' });
+    await assert.rejects(service.approveCase({ actorToken: admin.token, caseId: item.id, reason: 'self approval' }), { code: 'distinct_approver_required' });
+    await assert.rejects(service.approveCase({ actorToken: target.token, caseId: item.id, reason: 'target approval' }), { code: 'permission_denied' });
+    const applied = await service.approveCase({ actorToken: approver.token, caseId: item.id, reason: 'independently verified' });
+    assert.equal(applied.status, 'applied');
+    assert.equal((await service.getUser(target.user.id))?.totpEnabled, false);
+    assert.equal(await service.authenticate(target.token), null);
+    assert.equal((await service.login({ email: target.user.email, password })).user.id, target.user.id);
+    await assert.rejects(service.approveCase({ actorToken: approver.token, caseId: item.id, reason: 'replay' }), { code: 'case_unavailable' });
+    const stale = await service.createCase({ actorToken: admin.token, accountId: target.user.id, action: 'lock', reason: 'review' });
+    await service.adminSetRoles({ actorToken: admin.token, accountId: target.user.id, roles: ['editor'] });
+    await assert.rejects(service.approveCase({ actorToken: approver.token, caseId: stale.id, reason: 'reviewed' }), { code: 'case_target_changed' });
+});
+test('impersonation is opt-in, marked, expiring, denied privileged targets and incapable of credential or admin mutation', async (t) => {
+    const { service, advance } = await setup(t, { allowImpersonation: true }), admin = await service.bootstrapAdmin({ email: 'impersonator@example.com', password }), target = await service.register({ email: 'subject@example.com', password });
+    await assert.rejects(service.createImpersonation({ actorToken: admin.token, accountId: admin.user.id, reason: 'self' }), { code: 'impersonation_denied' });
+    const issued = await service.createImpersonation({ actorToken: admin.token, accountId: target.user.id, reason: 'support request' });
+    assert.equal(issued.principal.impersonatorId, admin.user.id);
+    assert.equal(issued.principal.authenticatedAt, 0);
+    assert.deepEqual(issued.principal.permissions, ['content.read']);
+    await assert.rejects(service.stepUp({ token: issued.token, password }), { code: 'impersonation_restricted' });
+    await assert.rejects(service.beginTotp(issued.token), { code: 'impersonation_restricted' });
+    await assert.rejects(service.exportAccount(issued.token), { code: 'impersonation_restricted' });
+    await assert.rejects(service.adminSetRoles({ actorToken: issued.token, accountId: admin.user.id, roles: ['user'] }), { code: 'impersonation_restricted' });
+    advance(600001);
+    assert.equal(await service.authenticate(issued.token), null);
+    const fresh = await service.stepUp({ token: admin.token, password }), again = await service.createImpersonation({ actorToken: fresh.token, accountId: target.user.id, reason: 'followup' });
+    await service.adminSetRoles({ actorToken: fresh.token, accountId: target.user.id, roles: ['admin'] });
+    assert.equal(await service.authenticate(again.token), null);
+});
+test('profile and terms validation persist registration data without allowing private metadata or authority injection', async (t) => {
+    const { createRegistrationPolicy } = await import('../src/registration.ts');
+    const registrationPolicy = createRegistrationPolicy({ termsVersion: '2026-09', metadata: { nickname: { type: 'string', scope: 'public' }, internalNote: { type: 'string', scope: 'private', default: 'operator-only' } } });
+    const { service } = await setup(t, { registrationPolicy });
+    await assert.rejects(service.register({ email: 'terms@example.com', password }), { code: 'invalid_registration_profile' });
+    const user = await service.register({ email: 'terms@example.com', password, profile: { termsAccepted: true, displayName: 'Synthetic name', metadata: { nickname: 'test' } } });
+    assert.equal(user.user.profile?.terms?.version, '2026-09');
+    assert.equal(user.user.profile?.metadata.internalNote, undefined);
+    await assert.rejects(service.updateProfile({ token: user.token, profile: { metadata: { internalNote: 'overwritten' } } }), { code: 'invalid_registration_profile' });
+    const updated = await service.updateProfile({ token: user.token, profile: { displayName: 'Changed' } });
+    assert.equal(updated.displayName, 'Changed');
+    assert.equal((await service.getProfile(user.token)).metadata.nickname, 'test');
+    assert.deepEqual((await service.authenticate(user.token))?.roles, ['user']);
+});
+test('human email codes expire, count failed attempts durably and are consumed atomically', async (t) => {
+    const { service, advance, options } = await setup(t), user = await service.register({ email: 'numeric@example.com', password });
+    const issued = await service.issueEmailCode({ email: user.user.email });
+    assert.match(issued.flowId, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(issued.code!, /^\d{6}$/);
+    const wrong = issued.code === '000000' ? '000001' : '000000';
+    for (let n = 0; n < 5; n++)
+        await assert.rejects(service.consumeEmailCode({ flowId: issued.flowId, code: wrong }), { code: 'invalid_code' });
+    await service.close();
+    const reopened = await createAuthService(options);
+    try {
+        await assert.rejects(reopened.consumeEmailCode({ flowId: issued.flowId, code: issued.code! }), { code: 'invalid_code' });
+        const next = await reopened.issueEmailCode({ email: user.user.email });
+        const outcomes = await Promise.allSettled([reopened.consumeEmailCode({ flowId: next.flowId, code: next.code! }), reopened.consumeEmailCode({ flowId: next.flowId, code: next.code! })]);
+        assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1);
+        const expired = await reopened.issueEmailCode({ email: user.user.email });
+        advance(600001);
+        await assert.rejects(reopened.consumeEmailCode({ flowId: expired.flowId, code: expired.code! }), { code: 'invalid_code' });
+        const absent = await reopened.issueEmailCode({ email: 'absent@example.com' });
+        assert.match(absent.flowId, /^[A-Za-z0-9_-]{43}$/);
+        assert.equal(absent.code, null);
+    }
+    finally {
+        await reopened.close();
+    }
+});
+test('email changes retain the old login during cooldown, allow cancellation and commit once with stable identity', async (t) => {
+    const { service, advance } = await setup(t, { sessionTtlMs: 172800000 }), user = await service.register({ email: 'old@example.com', password });
+    const cancelled = await service.requestEmailChange({ token: user.token, email: 'new@example.com', password });
+    assert.equal((await service.getUser(user.user.id))?.email, 'old@example.com');
+    await assert.rejects(service.requestEmailChange({ token: user.token, email: 'other@example.com', password }), { code: 'email_change_pending' });
+    await assert.rejects(service.confirmEmailChange(cancelled.verificationToken), { code: 'email_change_cooldown' });
+    await service.cancelEmailChange(cancelled.cancelToken);
+    await assert.rejects(service.confirmEmailChange(cancelled.verificationToken), { code: 'invalid_token' });
+    const pending = await service.requestEmailChange({ token: user.token, email: 'new@example.com', password });
+    advance(86400001);
+    const changed = await service.confirmEmailChange(pending.verificationToken);
+    assert.equal(changed.id, user.user.id);
+    assert.equal(changed.email, 'new@example.com');
+    assert.equal(changed.emailVerified, true);
+    assert.equal(await service.authenticate(user.token), null);
+    await assert.rejects(service.cancelEmailChange(pending.cancelToken), { code: 'invalid_token' });
+    assert.equal((await service.login({ email: 'new@example.com', password })).user.id, user.user.id);
+});
+test('email-change confirmation rejects concurrent ownership and intervening credential changes', async (t) => {
+    const { service, advance } = await setup(t, { sessionTtlMs: 172800000 }), first = await service.register({ email: 'first@example.com', password }), second = await service.register({ email: 'second@example.com', password });
+    const one = await service.requestEmailChange({ token: first.token, email: 'contested@example.com', password }), two = await service.requestEmailChange({ token: second.token, email: 'contested@example.com', password });
+    advance(86400001);
+    const raced = await Promise.allSettled([service.confirmEmailChange(one.verificationToken), service.confirmEmailChange(two.verificationToken)]);
+    assert.equal(raced.filter(r => r.status === 'fulfilled').length, 1);
+    const fresh = await service.login({ email: 'contested@example.com', password });
+    const pending = await service.requestEmailChange({ token: fresh.token, email: 'invalidated@example.com', password });
+    await service.changePassword({ token: fresh.token, currentPassword: password, password: password + ' new' });
+    advance(86400001);
+    await assert.rejects(service.confirmEmailChange(pending.verificationToken), { code: 'account_changed' });
+});
+test('administrative account setup, credential-free export and single-session revocation are scoped and audited', async (t) => {
+    const { service } = await setup(t), admin = await service.bootstrapAdmin({ email: 'owner@example.com', password });
+    const created = await service.adminCreateUser({ actorToken: admin.token, email: 'created@example.com', reason: 'requested account' });
+    assert.equal(created.user.emailVerified, false);
+    assert.deepEqual(created.user.roles, ['user']);
+    await assert.rejects(service.login({ email: created.user.email, password }), { code: 'invalid_credentials' });
+    await service.resetPassword({ token: created.setupToken, password });
+    const user = await service.login({ email: created.user.email, password }), other = await service.login({ email: created.user.email, password });
+    await assert.rejects(service.revokeSession({ token: user.token, sessionId: admin.principal.sessionId }), { code: 'permission_denied' });
+    await service.revokeSession({ token: user.token, sessionId: other.principal.sessionId });
+    assert.equal(await service.authenticate(other.token), null);
+    const exported = await service.adminExport({ actorToken: admin.token, accountId: user.user.id, reason: 'user request' });
+    assert.equal(JSON.stringify(exported).includes('passwordHash'), false);
+    await service.adminRevokeSession({ actorToken: admin.token, sessionId: user.principal.sessionId, reason: 'security request' });
+    assert.equal(await service.authenticate(user.token), null);
+    assert.ok((await service.listAudit()).events.some(e => e.action === 'admin.account_exported'));
+});
+test('idle sessions expire despite absolute lifetime and real activity refreshes bounded last-seen metadata', async (t) => {
+    const { service, advance } = await setup(t, { sessionIdleMs: 60000 }), user = await service.register({ email: 'idle@example.com', password, device: { id: Buffer.alloc(32, 1).toString('base64url'), label: 'Synthetic browser' } });
+    assert.equal(user.newDevice, true);
+    advance(30000);
+    assert.ok(await service.authenticate(user.token));
+    advance(40000);
+    assert.ok(await service.authenticate(user.token));
+    advance(60001);
+    assert.equal(await service.authenticate(user.token), null);
+    const again = await service.login({ email: user.user.email, password, device: { id: Buffer.alloc(32, 1).toString('base64url'), label: 'Synthetic browser' } });
+    assert.equal(again.newDevice, undefined);
+    assert.equal((await service.listSessions(user.user.id))[0]?.deviceLabel, 'Synthetic browser');
+    const other = await service.login({ email: user.user.email, password, device: { id: Buffer.alloc(32, 2).toString('base64url'), label: 'Other browser' } });
+    assert.equal(other.newDevice, true);
+    await assert.rejects(service.login({ email: user.user.email, password, device: { id: 'bad' } }), { code: 'invalid_device' });
+});
+test('trusted proof step-up rotates passwordless sessions and sign-in removal preserves a usable method', async (t) => {
+    const { service } = await setup(t), user = await service.createExternalAccount({ email: 'passwordless@example.com', provider: 'oidc', subject: 'subject', emailVerified: true }), session = await service.issueSession(user.id, { method: 'oidc', proof: (await service.getExternalProof('oidc', 'subject'))!.proof });
+    await assert.rejects(service.unlinkExternal({ token: session.token, provider: 'oidc', subject: 'subject' }), { code: 'last_sign_in_method' });
+    await service.addPasskey({ actorToken: session.token, credential: { id: 'only-passkey', publicKey: 'synthetic-key', counter: 0 } });
+    const stepped = await service.completeStepUp({ token: session.token, accountId: user.id, method: 'passkey', proof: { ...(await service.getPasskey('only-passkey'))!.proof, newCounter: 0 } });
+    assert.equal(await service.authenticate(session.token), null);
+    await service.unlinkExternal({ token: stepped.token, provider: 'oidc', subject: 'subject' });
+    await assert.rejects(service.removePasskey({ token: stepped.token, credentialId: 'only-passkey' }), { code: 'last_sign_in_method' });
+    await assert.rejects(service.completeStepUp({ token: stepped.token, accountId: 'other', method: 'passkey', proof: { ...(await service.getPasskey('only-passkey'))!.proof, newCounter: 0 } }), { code: 'step_up_denied' });
+});
+test('case notes and closure are fresh, bounded, audited and cleanup has a global row budget', async (t) => {
+    const { service, advance, now } = await setup(t), admin = await service.bootstrapAdmin({ email: 'case-owner@example.com', password }), user = await service.register({ email: 'case-user@example.com', password });
+    const item = await service.createCase({ actorToken: admin.token, accountId: user.user.id, action: 'lock', reason: 'investigation' });
+    const noted = await service.addCaseNote({ actorToken: admin.token, caseId: item.id, note: 'Reviewed submitted evidence' });
+    assert.equal(noted.notes?.length, 1);
+    const closed = await service.closeCase({ actorToken: admin.token, caseId: item.id, reason: 'No action required' });
+    assert.equal(closed.status, 'closed');
+    await assert.rejects(service.addCaseNote({ actorToken: admin.token, caseId: item.id, note: 'late note' }), { code: 'case_unavailable' });
+    for (let index = 0; index < 3; index++)
+        await service.putFlow({ id: 'cleanup-' + index, kind: 'test', data: {}, expires: now() + 1 });
+    advance(2);
+    assert.equal((await service.cleanup({ limit: 2 })).removed, 2);
+    assert.equal((await service.cleanup({ limit: 2 })).removed, 1);
+});
+test('exact email allow/block policy is normalized and applied to every enrollment path', async (t) => {
+    const { service } = await setup(t, { allowedEmails: ['Allowed@EXAMPLE.com', 'blocked@example.com'], blockedEmails: ['BLOCKED@example.com'] });
+    await assert.rejects(service.register({ email: 'other@example.com', password }), { code: 'registration_unavailable' });
+    await assert.rejects(service.createExternalAccount({ email: 'blocked@example.com', provider: 'oidc', subject: 'blocked', emailVerified: true }), { code: 'registration_unavailable' });
+    assert.equal((await service.register({ email: 'allowed@example.com', password })).user.email, 'allowed@example.com');
+});
+test('operator password checks run before new hashes, reject without leaking callback errors and do not block existing sign-in', async (t) => {
+    let reject = true, calls = 0;
+    const { service } = await setup(t, { checkPassword: async (value) => {
+            calls++;
+            if (reject)
+                throw new Error('sensitive ' + value);
+        } });
+    await assert.rejects(service.register({ email: 'policy@example.com', password }), { code: 'password_not_allowed', message: 'password_not_allowed' });
+    reject = false;
+    const user = await service.register({ email: 'policy@example.com', password });
+    reject = true;
+    await service.login({ email: user.user.email, password });
+    const before = calls;
+    await assert.rejects(service.changePassword({ token: user.token, currentPassword: password, password: password + ' new' }), { code: 'password_not_allowed' });
+    assert.equal(calls, before + 1);
+    assert.ok(await service.authenticate(user.token));
+});
+test('post-commit lifecycle hooks are bounded, credential-free and cannot roll back accounts', async (t) => {
+    const release: (() => void)[] = [], events: {
+        type: string;
+        accountId: string;
+    }[] = [];
+    const { service } = await setup(t, { onLifecycle: async (event) => { events.push(event); await new Promise<void>(resolve => release.push(resolve)); } });
+    try {
+        for (let index = 0; index < 6; index++)
+            await service.createExternalAccount({ email: 'hook' + index + '@example.com', provider: 'oidc', subject: String(index), emailVerified: true });
+        assert.equal((await service.listUsers()).users.length, 6);
+        assert.equal(service.getHookStats().accepted, 4);
+        assert.equal(service.getHookStats().dropped, 2);
+        assert.equal(events.length, 4);
+        assert.deepEqual(Object.keys(events[0]!).sort(), ['accountId', 'type']);
+    }
+    finally {
+        for (const finish of release)
+            finish();
+        await new Promise<void>(resolve => setImmediate(resolve));
+    }
+});
+test('pending external proofs cannot survive factor reset, identity unlink or credential-version changes', async (t) => {
+    const { service, now, advance } = await setup(t), user = await service.register({ email: 'stale-oidc@example.com', password });
+    await service.linkExternal({ actorToken: user.token, provider: 'oidc', subject: 'bound' });
+    const setupTotp = await service.beginTotp(user.token), otp = new TOTP({ secret: setupTotp.secret });
+    await service.confirmTotp({ token: user.token, code: otp.generate({ timestamp: now() }) });
+    const snapshot = (await service.getExternalProof('oidc', 'bound'))!;
+    advance(30000);
+    await service.disableTotp({ token: user.token, password, code: otp.generate({ timestamp: now() }) });
+    await assert.rejects(service.issueSession(user.user.id, { method: 'oidc', proof: snapshot.proof }), { code: 'stale_auth_proof' });
+    const linked = (await service.getExternalProof('oidc', 'bound'))!;
+    await service.unlinkExternal({ token: user.token, provider: 'oidc', subject: 'bound' });
+    await assert.rejects(service.issueSession(user.user.id, { method: 'oidc', proof: linked.proof }), { code: 'stale_auth_proof' });
+});
+test('passkey proof issuance atomically checks ownership, version and key while advancing counters once', async (t) => {
+    const { service } = await setup(t), user = await service.register({ email: 'proof-key@example.com', password });
+    await service.addPasskey({ actorToken: user.token, credential: { id: 'bound-key', publicKey: 'original-key', counter: 1 } });
+    const proof = { ...(await service.getPasskey('bound-key'))!.proof, newCounter: 2 };
+    const raced = await Promise.allSettled([service.issueSession(user.user.id, { method: 'passkey', proof }), service.issueSession(user.user.id, { method: 'passkey', proof })]);
+    assert.equal(raced.filter(r => r.status === 'fulfilled').length, 1);
+    assert.equal((await service.getPasskey('bound-key'))?.credential.counter, 2);
+    const removed = { ...(await service.getPasskey('bound-key'))!.proof, newCounter: 3 };
+    await service.removePasskey({ token: user.token, credentialId: 'bound-key' });
+    await service.addPasskey({ actorToken: user.token, credential: { id: 'bound-key', publicKey: 'replacement-key', counter: 2 } });
+    await assert.rejects(service.issueSession(user.user.id, { method: 'passkey', proof: removed }), { code: 'stale_auth_proof' });
+});
+test('passkey step-up uses the durable MFA attempt budget and refuses mismatched account proofs', async (t) => {
+    const { service, now } = await setup(t), user = await service.register({ email: 'step-proof@example.com', password });
+    await service.addPasskey({ actorToken: user.token, credential: { id: 'step-key', publicKey: 'public-key', counter: 0 } });
+    const setupTotp = await service.beginTotp(user.token), otp = new TOTP({ secret: setupTotp.secret });
+    const current = otp.generate({ timestamp: now() });
+    await service.confirmTotp({ token: user.token, code: current });
+    const proof = { ...(await service.getPasskey('step-key'))!.proof, newCounter: 1 };
+    const wrong = current === '000000' ? '000001' : '000000';
+    for (let index = 0; index < 10; index++)
+        await assert.rejects(service.completeStepUp({ token: user.token, accountId: user.user.id, method: 'passkey', proof, totp: wrong }), { code: 'invalid_credentials' });
+    await assert.rejects(service.completeStepUp({ token: user.token, accountId: user.user.id, method: 'passkey', proof, totp: wrong }), { code: 'authentication_rate_limited' });
+    assert.equal((await service.getPasskey('step-key'))?.credential.counter, 0);
+});
+test('account-wide session revocation invalidates pending primary proof and administrator impersonation', async (t) => {
+    const { service } = await setup(t, { allowImpersonation: true }), admin = await service.bootstrapAdmin({ email: 'revoke-admin@example.com', password }), target = await service.register({ email: 'revoke-target@example.com', password });
+    await service.linkExternal({ actorToken: target.token, provider: 'oidc', subject: 'pending' });
+    const snapshot = (await service.getExternalProof('oidc', 'pending'))!;
+    await service.revokeSessions(target.user.id);
+    await assert.rejects(service.issueSession(target.user.id, { method: 'oidc', proof: snapshot.proof }), { code: 'stale_auth_proof' });
+    const impersonated = await service.createImpersonation({ actorToken: admin.token, accountId: target.user.id, reason: 'support' });
+    await service.revokeSessions(admin.user.id);
+    assert.equal(await service.authenticate(impersonated.token), null);
+});
+test('bounded deletion purge selects due accounts before applying its page limit',async t=>{
+ const {service,advance}=await setup(t),first=await service.register({email:'later-deletion@example.com',password}),second=await service.register({email:'earlier-deletion@example.com',password});await service.deleteAccount({token:second.token,password});advance(86400000);const fresh=await service.login({email:first.user.email,password});await service.deleteAccount({token:fresh.token,password});advance(6*86400000+1);assert.deepEqual(await service.purgeDeleted({limit:1}),{purged:1});assert.equal(await service.getUser(second.user.id),null);assert.equal((await service.getUser(first.user.id))?.status,'pending-delete');
+});

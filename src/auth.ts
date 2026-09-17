@@ -1,0 +1,392 @@
+import type { RegistrationInput, MetadataValue } from './registration.ts';
+import { isHoneypotFilled } from './registration.ts';
+import type { Presentation } from './presentation.ts';
+import { createAuthFlows } from './auth-flows.ts';
+import type { OidcProvider } from './oidc.ts';
+import type { PasskeyProvider } from './passkeys.ts';
+import type { RuntimeExtension, ExtensionRequest } from '@jimhoyd/urlcode/extensions';
+import type { AuthService, AuthPrincipal, AuthUser } from './auth-core.ts';
+import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, httpFailure, jsonResponse, pageResponse as renderPage, readFields, wantsJson, passkeyScript } from './auth-ui.ts';
+import type { AuthHttpResponse } from './auth-ui.ts';
+export interface AuthExtensionOptions {
+    presentation?: Presentation;
+    service: AuthService;
+    csrfKey: Uint8Array;
+    projectSha256: string;
+    providers?: Record<string, OidcProvider>;
+    passkeys?: PasskeyProvider;
+    sendEmailCode?: (message: {
+        email: string;
+        flowId: string;
+        code: string;
+        signal: AbortSignal;
+    }) => Promise<void>;
+    sendNotice?: (message: {
+        email: string;
+        event: 'password-changed' | 'new-device';
+        signal: AbortSignal;
+    }) => Promise<void>;
+    sendToken?: (message: {
+        email: string;
+        token: string;
+        purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change';
+        signal: AbortSignal;
+    }) => Promise<void>;
+}
+export function hasPermission(principal: AuthPrincipal, permission: string): boolean { return principal.permissions.includes('*') || principal.permissions.includes(permission); }
+const schema = { type: 'object', additionalProperties: false, properties: { registration: { enum: ['open', 'invite-only', 'waitlist', 'off'] } } };
+const policySchema = { type: 'object', additionalProperties: false, properties: { role: { type: 'string', minLength: 1, maxLength: 64 }, permission: { type: 'string', minLength: 1, maxLength: 128 }, verified: { type: 'boolean' }, freshWithinSeconds: { type: 'integer', minimum: 1, maximum: 3600 }, onDeny: { enum: [401, 403, 404, 'sign-in'] } }, minProperties: 0 };
+function renderForm(action: string, csrf: string, fields: string, button: string): string { return `<form method="post" action="${escapeHtml(action)}">${csrfField(csrf)}${fields}<button type="submit">${escapeHtml(button)}</button></form>`; }
+const form = renderForm;
+function hidden(name: string, value: string): string { return `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`; }
+const formField = baseField;
+const credentials = () => formField('email', 'Email address', 'email', 'username') + formField('password', 'Password', 'password', 'current-password');
+const factors = () => formField('totp', 'Authenticator code (if enabled)', 'text', 'one-time-code', false) + formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false);
+export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
+    return { name: 'auth', version: '1', projectSha256: options.projectSha256, targets: ['node'], schema, policySchema, credentialHeaders: ['cookie', 'authorization', 'x-csrf-token'],
+        activate(config, context) {
+            if (context.mounts.length !== 1)
+                throw new Error('Auth requires exactly one mount');
+            const mount = context.mounts[0]!, http = new AuthHttp({ origin: context.origin, csrfKey: options.csrfKey }), service = options.service, registrationMode = String(config.registration || 'off'), registration = registrationMode === 'open';
+            if (registrationMode !== service.getRegistrationMode())
+                throw new Error('Project registration mode must match operator auth service mode');
+            const registrationSchema = service.getRegistrationSchema();
+            const metadataFields = Object.entries(registrationSchema.metadata ?? {});
+            function profileInput(fields: Record<string, string>): RegistrationInput { const metadata: Record<string, MetadataValue> = {}; for (const [name, field] of metadataFields) {
+                const value = fields['meta.' + name];
+                if (value === undefined || value === '')
+                    continue;
+                if (field.type === 'number') {
+                    if (!Number.isFinite(Number(value)))
+                        throw new AuthHttpError(400, 'Invalid numeric metadata');
+                    metadata[name] = Number(value);
+                }
+                else if (field.type === 'boolean') {
+                    if (value !== 'true' && value !== 'false')
+                        throw new AuthHttpError(400, 'Invalid boolean metadata');
+                    metadata[name] = value === 'true';
+                }
+                else
+                    metadata[name] = value;
+            } return { ...(fields.displayName !== undefined ? { displayName: fields.displayName } : {}), ...(fields.locale ? { locale: fields.locale } : {}), ...(Object.keys(metadata).length ? { metadata } : {}), ...(fields.termsAccepted !== undefined ? { termsAccepted: fields.termsAccepted === 'true' } : {}) }; }
+            const profileMarkup = (formField: typeof baseField = baseField) => formField('displayName', 'Display name', 'text', 'nickname', false) + formField('locale', 'Preferred language', 'text', 'language', false) + metadataFields.map(([name, field]) => formField('meta.' + name, name + (field.type === 'boolean' ? ' (true or false)' : ''), field.type === 'number' ? 'number' : 'text', 'off', field.required === true)).join('') + (registrationSchema.termsVersion ? `<label><input type="checkbox" name="termsAccepted" value="true" required> I accept terms version ${escapeHtml(registrationSchema.termsVersion)}</label>` : '');
+            const flows = createAuthFlows({ ...options, onSession: async (request, result) => { if (result.newDevice)
+                    await notice(result.user.email, 'new-device'); return http.device(request).headers; }, enrollment: { required: !!registrationSchema.termsVersion || metadataFields.some(([, field]) => field.required), fields: () => profileMarkup(), read: profileInput, names: ['displayName', 'locale', 'termsAccepted', ...metadataFields.map(([name]) => 'meta.' + name)] } }, http, mount, registration);
+            const passkeyButton = (kind: 'register' | 'login' | 'step-up', text: (value: string) => string = value => value) => options.passkeys ? `<button type="button" data-passkey="${kind}" data-base="${escapeHtml(mount)}">${escapeHtml(text(kind === 'register' ? 'Add a passkey' : kind === 'step-up' ? 'Confirm identity with a passkey' : 'Sign in with a passkey'))}</button><p role="status" aria-live="polite" data-passkey-status></p>` : '';
+            async function principal(request: ExtensionRequest): Promise<{
+                token: string;
+                principal: AuthPrincipal;
+            }> { const token = http.session(request); const found = token ? await service.authenticate(token) : null; if (!token || !found)
+                throw new AuthHttpError(401, 'Sign in required'); return { token, principal: found }; }
+            function redirect(path: string, headers: [
+                string,
+                string
+            ][] = []): AuthHttpResponse { return jsonResponse(303, { redirect: path }, [['location', path], ...headers]); }
+            const createNavigation = (text: (value: string) => string) => `<nav aria-label="${escapeHtml(text('Account'))}">${[['account', 'Account'], ['sessions', 'Sessions'], ['step-up', 'Confirm identity'], ['methods', 'Sign-in methods']].map(([path, label]) => `<a href="${escapeHtml(mount + '/' + path)}">${escapeHtml(text(label!))}</a>`).join('')}</nav>`;
+            async function deliver(email: string, token: string, purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change', strict = false): Promise<void> { if (!options.sendToken)
+                throw new AuthHttpError(503, 'Email delivery is not configured'); const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; try {
+                await Promise.race([options.sendToken({ email, token, purpose, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Delivery timeout')); }, 5000); })]);
+            }
+            catch (error) {
+                if (strict)
+                    throw error;
+            }
+            finally {
+                if (timer)
+                    clearTimeout(timer);
+            } }
+            async function notify(email: string, purpose: 'verify-email' | 'reset-password'): Promise<void> {
+                if (!options.sendToken)
+                    throw new AuthHttpError(503, 'Email delivery is not configured');
+                const issued = await service.issueToken({ email, purpose });
+                if (!issued.token)
+                    return;
+                await deliver(email, issued.token, purpose);
+            }
+            async function notice(email: string, event: 'password-changed' | 'new-device' = 'password-changed'): Promise<void> { if (!options.sendNotice)
+                return; const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; try {
+                await Promise.race([options.sendNotice({ email, event, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
+            }
+            catch { }
+            finally {
+                if (timer)
+                    clearTimeout(timer);
+            } }
+            return {
+                async authorize(requirement, request) {
+                    try {
+                        const token = http.session(request), user = token ? await service.authenticate(token) : null;
+                        const allowed = user && (!requirement.role || user.roles.includes(String(requirement.role))) && (!requirement.permission || hasPermission(user, String(requirement.permission))) && (!requirement.verified || user.emailVerified) && (!requirement.freshWithinSeconds || Date.now() - user.authenticatedAt <= Number(requirement.freshWithinSeconds) * 1000);
+                        if (allowed) {
+                            if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method))
+                                http.verify(request, {});
+                            return undefined;
+                        }
+                        if (requirement.onDeny === 'sign-in' && ['GET', 'HEAD'].includes(request.method))
+                            return redirect(mount + '/login');
+                        return jsonResponse(typeof requirement.onDeny === 'number' ? requirement.onDeny : user ? 403 : 401, { error: 'Access denied' });
+                    }
+                    catch (error) {
+                        return httpFailure(error, request);
+                    }
+                },
+                async handle(request) {
+                    let accountLocale: string | undefined;
+                    if (options.presentation) {
+                        try {
+                            const session = http.session(request), actor = session ? await service.authenticate(session) : null;
+                            accountLocale = actor ? (await service.getUser(actor.id))?.profile?.locale : undefined;
+                        }
+                        catch { }
+                    }
+                    const presentation = options.presentation?.resolve({ ...(accountLocale ? { accountLocale } : {}), ...(request.query.get('lang') ? { queryLocale: request.query.get('lang')! } : {}), ...(request.headers.get('accept-language') ? { acceptLanguage: request.headers.get('accept-language')! } : {}) });
+                    const text = (value: string) => presentation?.textSource(value) ?? value;
+                    const navigation = createNavigation(source => presentation?.textSource(source) ?? source);
+                    const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4], presentation] as Parameters<typeof renderPage>);
+                    const formField = (name: string, label: string, type = 'text', autocomplete = 'off', required = true) => baseField(name, presentation?.textSource(label) ?? label, type, autocomplete, required);
+                    const form = (action: string, csrf: string, fields: string, button: string) => renderForm(action, csrf, fields, presentation?.textSource(button) ?? button);
+                    const profileFields = () => profileMarkup(formField);
+                    const credentials = () => formField('email', 'Email address', 'email', 'username') + formField('password', 'Password', 'password', 'current-password');
+                    const factors = () => formField('totp', 'Authenticator code (if enabled)', 'text', 'one-time-code', false) + formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false);
+                    try {
+                        const path = request.path.slice(mount.length) || '/';
+                        const flowResult = await flows.handle(request);
+                        if (flowResult)
+                            return flowResult;
+                        if (path === '/assets/passkeys.js' && ['GET', 'HEAD'].includes(request.method) && options.passkeys)
+                            return { status: 200, headers: [['content-type', 'text/javascript; charset=utf-8'], ['cache-control', 'no-store'], ['x-content-type-options', 'nosniff']], body: new TextEncoder().encode(passkeyScript) };
+                        if (!['GET', 'HEAD', 'POST'].includes(request.method))
+                            return jsonResponse(405, { error: 'Method not allowed' }, [['allow', 'GET, HEAD, POST']]);
+                        if (request.method !== 'POST') {
+                            const { csrf, headers } = http.prepare(request);
+                            if (path === '/csrf')
+                                return jsonResponse(200, { csrf }, headers);
+                            if (path === '/' || path === '/login')
+                                return pageResponse('Sign in', form(mount + '/identify', csrf, formField('email', 'Email address', 'email', 'username'), 'Continue') + passkeyButton('login', text) + flows.buttons(csrf, false, text) + `<nav>${registrationMode !== 'off' ? `<a href="${escapeHtml(mount + '/register')}">Create account</a>` : ''}${options.sendToken ? ` <a href="${escapeHtml(mount + '/forgot-password')}">Forgot password</a>` : ''}${options.sendEmailCode ? ` <a href="${escapeHtml(mount + '/email-code')}">Email sign in</a>` : ''}</nav>`, 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                            if (path === '/register') {
+                                const invitations = request.query.getAll('token');
+                                if (invitations.length > 1 || invitations.some(token => token.length > 512))
+                                    throw new AuthHttpError(400, 'Invalid invitation');
+                                if (registrationMode === 'off')
+                                    throw new AuthHttpError(404, 'Not found');
+                                return pageResponse(registrationMode === 'waitlist' ? 'Request an account' : 'Create account', form(mount + '/register', csrf, formField('email', 'Email address', 'email', 'username') + formField('password', 'Password (at least 15 characters)', 'password', 'new-password') + profileFields() + '<div hidden><label>Leave empty<input name="website" tabindex="-1" autocomplete="off"></label></div>' + (registrationMode === 'invite-only' ? (invitations.length ? hidden('invitationToken', invitations[0]!) : formField('invitationToken', 'Invitation token')) : ''), registrationMode === 'waitlist' ? 'Request account' : 'Create account'), 200, headers);
+                            }
+                            if (path === '/forgot-password') {
+                                if (!options.sendToken)
+                                    throw new AuthHttpError(404, 'Not found');
+                                return pageResponse('Reset password', form(mount + '/forgot-password', csrf, formField('email', 'Email address', 'email', 'username'), 'Send reset link'), 200, headers);
+                            }
+                            if (path === '/email-code') {
+                                if (!options.sendEmailCode)
+                                    throw new AuthHttpError(404, 'Not found');
+                                const flows = request.query.getAll('flowId');
+                                if (flows.length > 1 || flows.some(value => !/^[A-Za-z0-9_-]{43}$/.test(value)))
+                                    throw new AuthHttpError(400, 'Invalid email flow');
+                                return pageResponse('Sign in by email', flows.length ? form(mount + '/email-code', csrf, hidden('flowId', flows[0]!) + formField('code', 'Six-digit email code', 'text', 'one-time-code') + factors(), 'Sign in') : form(mount + '/send-email-code', csrf, formField('email', 'Email address', 'email', 'username'), 'Send sign-in code'), 200, headers);
+                            }
+                            if (path === '/verify-email-change' || path === '/cancel-email-change') {
+                                const tokens = request.query.getAll('token');
+                                if (tokens.length !== 1 || tokens[0]!.length > 512)
+                                    throw new AuthHttpError(400, 'A single token is required');
+                                return pageResponse(path === '/verify-email-change' ? 'Confirm new email after the 24-hour cooling period' : 'Cancel email change', form(mount + path, csrf, hidden('token', tokens[0]!), 'Confirm'), 200, headers);
+                            }
+                            if (path === '/cancel-deletion') {
+                                const tokens = request.query.getAll('token');
+                                if (tokens.length !== 1 || tokens[0]!.length > 512)
+                                    throw new AuthHttpError(400, 'A single token is required');
+                                return pageResponse('Cancel account deletion', form(mount + path, csrf, hidden('token', tokens[0]!), 'Keep my account'), 200, headers);
+                            }
+                            if (path === '/verify' || path === '/reset') {
+                                const tokens = request.query.getAll('token');
+                                if (tokens.length !== 1 || tokens[0]!.length > 512)
+                                    throw new AuthHttpError(400, 'A single token is required');
+                                return pageResponse(path === '/verify' ? 'Verify email' : 'Choose a new password', form(mount + path, csrf, hidden('token', tokens[0]!) + (path === '/reset' ? formField('password', 'New password', 'password', 'new-password') : ''), path === '/verify' ? 'Verify email' : 'Reset password'), 200, headers);
+                            }
+                            const current = await principal(request);
+                            if (path === '/account') {
+                                const user = await service.getUser(current.principal.id);
+                                if (!user)
+                                    throw new AuthHttpError(401, 'Sign in required');
+                                if (wantsJson(request))
+                                    return jsonResponse(200, { user, csrf, ...(current.principal.impersonatorId ? { impersonatorId: current.principal.impersonatorId } : {}) }, headers);
+                                if (current.principal.impersonatorId)
+                                    return pageResponse('Support impersonation', navigation + '<p role="alert">You are viewing this account as a support administrator. Account security changes are disabled. End impersonation to sign in as yourself.</p>' + form(mount + '/logout', csrf, '', 'End impersonation'), 200, headers);
+                                return pageResponse('Your account', navigation + `<p>${escapeHtml(user.email)}</p><p>Email ${user.emailVerified ? 'verified' : 'not yet verified'}. Authenticator ${user.totpEnabled ? 'enabled' : 'not enabled'}.</p>` + form(mount + '/logout', csrf, '', 'Sign out') + (options.sendToken && !user.emailVerified ? form(mount + '/send-verification', csrf, '', 'Send verification email') : '') + form(mount + '/totp/begin', csrf, '', 'Set up authenticator') + form(mount + '/totp/disable', csrf, formField('password', 'Password', 'password', 'current-password') + formField('code', 'Authenticator code', 'text', 'one-time-code'), 'Disable authenticator') + (options.sendToken ? form(mount + '/change-email', csrf, formField('email', 'New email address', 'email', 'email') + formField('password', 'Current password (if configured)', 'password', 'current-password', false) + factors(), 'Request email change (24-hour cooling period)') : '') + form(mount + '/profile', csrf, profileFields(), 'Update profile') + form(mount + '/change-password', csrf, formField('currentPassword', 'Current password', 'password', 'current-password') + formField('password', 'New password', 'password', 'new-password') + factors(), 'Change password and sign out all sessions') + form(mount + '/export', csrf, '', 'Export account data') + (options.sendToken ? form(mount + '/delete', csrf, '<p>Deletion signs out all sessions immediately. A cancellation link will be emailed, valid for seven days before permanent removal. Confirm your identity first.</p>' + formField('confirmation', 'Type DELETE to confirm') + formField('password', 'Password (if configured)', 'password', 'current-password', false) + factors(), 'Schedule account deletion') : '') + passkeyButton('register', text) + flows.buttons(csrf, true, text), 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                            }
+                            if (path === '/sessions') {
+                                const sessions = await service.listSessions(current.principal.id);
+                                if (wantsJson(request))
+                                    return jsonResponse(200, { sessions, csrf }, headers);
+                                return pageResponse('Your sessions', navigation + `<ul>${sessions.map(session => `<li>Started ${escapeHtml(new Date(session.created).toISOString())}; expires ${escapeHtml(new Date(session.expires).toISOString())}${form(mount + '/revoke-session', csrf, hidden('sessionId', session.id), 'Revoke this session')}</li>`).join('')}</ul>` + form(mount + '/revoke-sessions', csrf, '', 'Sign out all sessions'), 200, headers);
+                            }
+                            if (path === '/methods') {
+                                const methods = await service.exportAccount(current.token);
+                                if (wantsJson(request))
+                                    return jsonResponse(200, { passkeys: methods.passkeys, identities: methods.identities, csrf }, headers);
+                                return pageResponse('Sign-in methods', navigation + '<h2>Passkeys</h2>' + methods.passkeys.map(key => form(mount + '/passkeys/remove', csrf, hidden('credentialId', key.id) + `<p>${escapeHtml(key.id)}</p>`, 'Remove passkey')).join('') + '<h2>Linked providers</h2>' + methods.identities.map(identity => form(mount + '/providers/unlink', csrf, hidden('provider', identity.provider) + hidden('subject', identity.subject) + `<p>${escapeHtml(identity.provider)}: ${escapeHtml(identity.subject)}</p>`, 'Unlink provider')).join('') + '<p>The last sign-in method cannot be removed.</p>', 200, headers);
+                            }
+                            if (path === '/step-up')
+                                return pageResponse('Confirm your identity', navigation + form(mount + '/step-up', csrf, formField('password', 'Password', 'password', 'current-password') + factors(), 'Confirm identity') + passkeyButton('step-up', text), 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                            throw new AuthHttpError(404, 'Not found');
+                        }
+                        const fields = readFields(request, ['email', 'password', 'currentPassword', 'confirmation', 'invitationToken', 'totp', 'recoveryCode', 'token', 'code', 'sessionId', 'credentialId', 'provider', 'subject', 'flowId', 'displayName', 'locale', 'termsAccepted', 'website', ...metadataFields.map(([name]) => 'meta.' + name)]);
+                        http.verify(request, fields);
+                        if (path === '/identify') {
+                            const email = fields.email || '';
+                            if (email.length > 320 || !email.includes('@'))
+                                throw new AuthHttpError(400, 'Enter an email address');
+                            return pageResponse('Sign in', form(mount + '/login', fields.csrf || '', `<label>Email address<input name="email" type="email" autocomplete="username" value="${escapeHtml(email)}" readonly></label>` + formField('password', 'Password', 'password', 'current-password') + factors(), 'Sign in') + passkeyButton('login', text) + flows.buttons(fields.csrf || '', false, text), 200, [], options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                        }
+                        if (path === '/login' || path === '/register') {
+                            if (path === '/register' && isHoneypotFilled(fields.website))
+                                return jsonResponse(202, { message: 'Registration request received.' });
+                            if (path === '/register' && registrationMode === 'off')
+                                throw new AuthHttpError(404, 'Not found');
+                            if (path === '/register' && registrationMode === 'waitlist') {
+                                await service.requestRegistration({ email: fields.email || '', password: fields.password || '', profile: profileInput(fields) });
+                                return jsonResponse(202, { message: 'Registration request received.' });
+                            }
+                            const device = http.device(request);
+                            const result = path === '/register' ? await service.register({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, profile: profileInput(fields), ...(fields.invitationToken ? { invitationToken: fields.invitationToken } : {}) }) : await service.login({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            if (result.newDevice)
+                                await notice(result.user.email, 'new-device');
+                            return wantsJson(request) ? jsonResponse(path === '/register' ? 201 : 200, { user: result.user, csrf: http.token(result.token) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
+                        }
+                        if (path === '/send-email-code') {
+                            if (!options.sendEmailCode)
+                                throw new AuthHttpError(404, 'Not found');
+                            const email = fields.email || '', issued = await service.issueEmailCode({ email });
+                            if (issued.code) {
+                                const controller = new AbortController();
+                                let timer: ReturnType<typeof setTimeout> | undefined;
+                                try {
+                                    await Promise.race([options.sendEmailCode({ email, flowId: issued.flowId, code: issued.code, signal: controller.signal }), new Promise<void>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 5000); })]);
+                                }
+                                catch { }
+                                finally {
+                                    if (timer)
+                                        clearTimeout(timer);
+                                }
+                            }
+                            return wantsJson(request) ? jsonResponse(200, { message: 'If this account is eligible, a sign-in code will be sent.', flowId: issued.flowId }) : pageResponse('Enter your email code', form(mount + '/email-code', fields.csrf || '', hidden('flowId', issued.flowId) + formField('code', 'Six-digit email code', 'text', 'one-time-code') + factors(), 'Sign in'));
+                        }
+                        if (path === '/email-code') {
+                            if (!options.sendEmailCode)
+                                throw new AuthHttpError(404, 'Not found');
+                            const device = http.device(request);
+                            const result = await service.consumeEmailCode({ device: { id: device.id, label: device.label }, flowId: fields.flowId || '', code: fields.code || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            if (result.newDevice)
+                                await notice(result.user.email, 'new-device');
+                            return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
+                        }
+                        if (path === '/forgot-password') {
+                            await notify(fields.email || '', 'reset-password');
+                            return jsonResponse(200, { message: 'If this account is eligible, a reset message will be sent.' });
+                        }
+                        if (path === '/verify-email-change') {
+                            await service.confirmEmailChange(fields.token || '');
+                            return jsonResponse(200, { changed: true }, http.clearSession());
+                        }
+                        if (path === '/cancel-email-change') {
+                            await service.cancelEmailChange(fields.token || '');
+                            return jsonResponse(200, { cancelled: true });
+                        }
+                        if (path === '/cancel-deletion') {
+                            await service.cancelDeletion(fields.token || '');
+                            return jsonResponse(200, { cancelled: true });
+                        }
+                        if (path === '/verify') {
+                            await service.consumeVerification(fields.token || '');
+                            return jsonResponse(200, { verified: true });
+                        }
+                        if (path === '/reset') {
+                            await service.resetPassword({ token: fields.token || '', password: fields.password || '' });
+                            return jsonResponse(200, { reset: true }, http.clearSession());
+                        }
+                        const current = await principal(request);
+                        if (current.principal.impersonatorId && path !== '/logout')
+                            throw new AuthHttpError(403, 'Security changes are disabled during impersonation');
+                        if (path === '/passkeys/remove') {
+                            await service.removePasskey({ token: current.token, credentialId: fields.credentialId || '' });
+                            return jsonResponse(200, { removed: true });
+                        }
+                        if (path === '/providers/unlink') {
+                            await service.unlinkExternal({ token: current.token, provider: fields.provider || '', subject: fields.subject || '' });
+                            return jsonResponse(200, { unlinked: true });
+                        }
+                        if (path === '/change-email') {
+                            if (!options.sendToken)
+                                throw new AuthHttpError(503, 'Email delivery required');
+                            const change = await service.requestEmailChange({ token: current.token, email: fields.email || '', ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            try {
+                                await deliver(change.oldEmail, change.cancelToken, 'cancel-email-change', true);
+                                await deliver(change.newEmail, change.verificationToken, 'verify-email-change', true);
+                            }
+                            catch {
+                                await service.cancelEmailChange(change.cancelToken);
+                                throw new AuthHttpError(503, 'Email delivery failed; change cancelled');
+                            }
+                            return jsonResponse(200, { requested: true, activateAfter: change.activateAfter });
+                        }
+                        if (path === '/revoke-session') {
+                            await service.revokeSession({ token: current.token, sessionId: fields.sessionId || '' });
+                            return jsonResponse(200, { revoked: true });
+                        }
+                        if (path === '/profile')
+                            return jsonResponse(200, { profile: await service.updateProfile({ token: current.token, profile: profileInput(fields) }) });
+                        if (path === '/export')
+                            return jsonResponse(200, await service.exportAccount(current.token), [['content-disposition', 'attachment; filename="account.json"']]);
+                        if (path === '/change-password') {
+                            await service.changePassword({ token: current.token, currentPassword: fields.currentPassword || '', password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            await notice(current.principal.email);
+                            return jsonResponse(200, { changed: true }, http.clearSession());
+                        }
+                        if (path === '/delete') {
+                            if (!options.sendToken)
+                                throw new AuthHttpError(503, 'Email delivery is required for deletion recovery');
+                            if (fields.confirmation !== 'DELETE')
+                                throw new AuthHttpError(400, 'Deletion confirmation required');
+                            const result = await service.deleteAccount({ token: current.token, ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            await deliver(current.principal.email, result.cancelToken, 'cancel-deletion');
+                            return jsonResponse(200, { deletionScheduled: true, cancellationDays: 7 }, http.clearSession());
+                        }
+                        if (path === '/logout') {
+                            await service.logout(current.token);
+                            return wantsJson(request) ? jsonResponse(200, { signedOut: true }, http.clearSession()) : redirect(mount + '/login', http.clearSession());
+                        }
+                        if (path === '/revoke-sessions') {
+                            await service.revokeSessions(current.principal.id);
+                            return jsonResponse(200, { signedOut: true }, http.clearSession());
+                        }
+                        if (path === '/step-up') {
+                            const result = await service.stepUp({ token: current.token, password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            return wantsJson(request) ? jsonResponse(200, { confirmed: true, csrf: http.token(result.token) }, http.sessionHeaders(result.token)) : redirect(mount + '/account', http.sessionHeaders(result.token));
+                        }
+                        if (path === '/send-verification') {
+                            await notify(current.principal.email, 'verify-email');
+                            return jsonResponse(200, { message: 'If this account is eligible, a verification message will be sent.' });
+                        }
+                        if (path === '/totp/begin') {
+                            const enrollment = await service.beginTotp(current.token);
+                            if (wantsJson(request))
+                                return jsonResponse(200, enrollment);
+                            return pageResponse('Set up authenticator', `<p>Add this key to your authenticator: <code>${escapeHtml(enrollment.secret)}</code></p>` + form(mount + '/totp/confirm', http.token(current.token), formField('code', 'Authenticator code', 'text', 'one-time-code'), 'Confirm authenticator'));
+                        }
+                        if (path === '/totp/confirm') {
+                            const enrolled = await service.confirmTotp({ token: current.token, code: fields.code || '' });
+                            return wantsJson(request) ? jsonResponse(200, enrolled) : pageResponse('Save your recovery codes', `<p>Store these codes securely. Each can be used once.</p><ul>${enrolled.recoveryCodes.map(code => `<li><code>${escapeHtml(code)}</code></li>`).join('')}</ul>`);
+                        }
+                        if (path === '/totp/disable') {
+                            await service.disableTotp({ token: current.token, password: fields.password || '', code: fields.code || '' });
+                            return jsonResponse(200, { disabled: true });
+                        }
+                        throw new AuthHttpError(404, 'Not found');
+                    }
+                    catch (error) {
+                        return httpFailure(error, request, presentation);
+                    }
+                },
+            };
+        } };
+}
+export type { AuthUser };

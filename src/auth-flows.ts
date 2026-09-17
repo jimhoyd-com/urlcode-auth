@@ -1,0 +1,218 @@
+import type { Presentation } from './presentation.ts';
+import type { RegistrationInput } from './registration.ts';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import type { ExtensionRequest } from '@jimhoyd/urlcode/extensions';
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server';
+import type { AuthService, AuthSessionResult } from './auth-core.ts';
+import type { OidcProvider, OidcFlow } from './oidc.ts';
+import type { PasskeyProvider } from './passkeys.ts';
+import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, jsonResponse, pageResponse as renderPage, readFields, wantsJson } from './auth-ui.ts';
+import type { AuthHttpResponse } from './auth-ui.ts';
+export interface AuthFlowOptions {
+    service: AuthService;
+    presentation?: Presentation;
+    onSession?: (request: ExtensionRequest, result: AuthSessionResult) => Promise<[
+        string,
+        string
+    ][]>;
+    providers?: Record<string, OidcProvider>;
+    passkeys?: PasskeyProvider;
+    enrollment?: {
+        required: boolean;
+        fields: () => string;
+        read: (fields: Record<string, string>) => RegistrationInput;
+        names: string[];
+    };
+}
+const id = () => randomBytes(32).toString('base64url');
+const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new AuthHttpError(400, 'Invalid authentication flow'); return value as Record<string, unknown>; }
+function checkBinding(data: Record<string, unknown>, binding: string | undefined): void { const expected = typeof data.browserHash === 'string' ? data.browserHash : ''; if (!binding || !/^[a-f0-9]{64}$/.test(expected) || !timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(hash(binding), 'hex')))
+    throw new AuthHttpError(403, 'Authentication flow belongs to another browser'); }
+function complex(request: ExtensionRequest): Record<string, unknown> { if (request.body.byteLength > 16384)
+    throw new AuthHttpError(413, 'Request body too large'); if (request.headers.get('content-type')?.split(';')[0] !== 'application/json')
+    throw new AuthHttpError(415, 'JSON required'); try {
+    return record(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(request.body)));
+}
+catch {
+    throw new AuthHttpError(400, 'Invalid authentication payload');
+} }
+function fresh(authenticatedAt: number): void { if (Date.now() - authenticatedAt > 300000)
+    throw new AuthHttpError(403, 'Confirm your identity first'); }
+export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount: string, registration: boolean) {
+    const service = options.service, providers = options.providers || {}, flowCookie = '__Host-urlcode-oidc';
+    if (Object.keys(providers).length > 16 || Object.keys(providers).some(name => !/^[a-z][a-z0-9-]{0,31}$/.test(name)))
+        throw new Error('Invalid provider names');
+    const cookie = (value: string, maxAge = 600): [
+        string,
+        string
+    ] => ['set-cookie', `${flowCookie}=${value}; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=${maxAge}`];
+    const finish = async (request: ExtensionRequest, result: AuthSessionResult): Promise<AuthHttpResponse> => { const headers = options.onSession ? await options.onSession(request, result) : []; return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token) }, [...http.sessionHeaders(result.token), cookie('', 0), ...headers]) : jsonResponse(303, { redirect: mount + '/account' }, [['location', mount + '/account'], ...http.sessionHeaders(result.token), cookie('', 0), ...headers]); };
+    return {
+        buttons(csrf: string, link = false, text: (value: string) => string = value => value): string { return Object.keys(providers).map(name => `<form method="post" action="${escapeHtml(mount + '/providers/' + name + (link ? '/link' : '/start'))}">${csrfField(csrf)}<button type="submit">${escapeHtml(text(link ? 'Link' : 'Sign in with'))} ${escapeHtml(name)}</button></form>`).join(''); },
+        async handle(request: ExtensionRequest): Promise<AuthHttpResponse | undefined> {
+            const presentation = options.presentation?.resolve({ ...(request.query.get('lang') ? { queryLocale: request.query.get('lang')! } : {}), ...(request.headers.get('accept-language') ? { acceptLanguage: request.headers.get('accept-language')! } : {}) });
+            const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4], presentation] as Parameters<typeof renderPage>);
+            const formField = (name: string, label: string, type = 'text', autocomplete = 'off', required = true) => baseField(name, presentation?.textSource(label) ?? label, type, autocomplete, required);
+            const path = request.path.slice(mount.length), match = /^\/providers\/([a-z][a-z0-9-]{0,31})\/(start|link|callback)$/.exec(path);
+            if (match) {
+                const name = match[1]!, operation = match[2]!, provider = providers[name];
+                if (!provider)
+                    throw new AuthHttpError(404, 'Not found');
+                if (operation !== 'callback') {
+                    if (request.method !== 'POST')
+                        throw new AuthHttpError(405, 'POST required');
+                    const fields = readFields(request, []);
+                    http.verify(request, fields);
+                    let actorToken: string | undefined;
+                    if (operation === 'link') {
+                        actorToken = http.session(request);
+                        const actor = actorToken ? await service.authenticate(actorToken) : null;
+                        if (!actor)
+                            throw new AuthHttpError(401, 'Sign in required');
+                        fresh(actor.authenticatedAt);
+                    }
+                    const started = await provider.start(), browser = id(), destination = new URL(started.url);
+                    if (destination.protocol !== 'https:' || destination.username || destination.password)
+                        throw new AuthHttpError(502, 'Invalid provider response');
+                    await service.putFlow({ id: started.flow.state, kind: 'oidc', expires: Date.now() + 600000, data: { name, flow: started.flow, browserHash: hash(browser), ...(actorToken ? { actorToken } : {}) } });
+                    return jsonResponse(303, { redirect: destination.href }, [['location', destination.href], cookie(browser)]);
+                }
+                if (!['GET', 'POST'].includes(request.method))
+                    throw new AuthHttpError(405, 'GET or POST required');
+                if (request.body.byteLength > 16384)
+                    throw new AuthHttpError(413, 'Request body too large');
+                const callback = new URL(request.target, http.origin), parameters = request.method === 'POST' ? new URLSearchParams(new TextDecoder('utf-8', { fatal: true }).decode(request.body)) : callback.searchParams;
+                if (request.method === 'POST' && request.headers.get('content-type')?.split(';')[0] !== 'application/x-www-form-urlencoded')
+                    throw new AuthHttpError(415, 'Form callback required');
+                const states = parameters.getAll('state');
+                if (states.length !== 1 || states[0]!.length > 256)
+                    throw new AuthHttpError(400, 'Invalid provider state');
+                const data = record(await service.consumeFlow(states[0]!, 'oidc'));
+                checkBinding(data, http.cookie(request, flowCookie));
+                if (data.name !== name)
+                    throw new AuthHttpError(400, 'Provider flow mismatch');
+                const identity = await provider.complete(request.method === 'POST' ? new Request(callback, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new Uint8Array(request.body).buffer }) : callback, data.flow as OidcFlow);
+                let issuer: URL;
+                try {
+                    issuer = new URL(identity.issuer);
+                }
+                catch {
+                    throw new AuthHttpError(401, 'Invalid identity issuer');
+                }
+                if (issuer.protocol !== 'https:' || issuer.username || issuer.password || identity.issuer.length > 2048)
+                    throw new AuthHttpError(401, 'Invalid identity issuer');
+                const identityProvider = 'oidc-' + createHash('sha256').update(identity.issuer).digest('hex').slice(0, 56);
+                if (typeof data.actorToken === 'string') {
+                    await service.linkExternal({ actorToken: data.actorToken, provider: identityProvider, subject: identity.subject });
+                    return jsonResponse(303, { linked: true }, [['location', mount + '/account'], cookie('', 0), ...http.sessionHeaders(data.actorToken)]);
+                }
+                let externalProof = await service.getExternalProof(identityProvider, identity.subject), user = externalProof?.user;
+                if (!user) {
+                    if (!registration || !identity.email || !identity.emailVerified)
+                        throw new AuthHttpError(403, 'An existing linked account is required');
+                    if (options.enrollment?.required) {
+                        const enrollment = id();
+                        await service.putFlow({ id: enrollment, kind: 'oidc-enrollment', expires: Date.now() + 600000, data: { email: identity.email, provider: identityProvider, subject: identity.subject, browserHash: data.browserHash } });
+                        const browser = http.prepare(request);
+                        return pageResponse('Complete your account', `<form method="post" action="${escapeHtml(mount + '/providers/enroll')}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(enrollment)}">${options.enrollment.fields()}<button type="submit">Create account</button></form>`, 200, browser.headers);
+                    }
+                    user = await service.createExternalAccount({ email: identity.email, emailVerified: true, provider: identityProvider, subject: identity.subject });
+                    externalProof = await service.getExternalProof(identityProvider, identity.subject);
+                }
+                if (!externalProof || externalProof.user.id !== user.id)
+                    throw new AuthHttpError(401, 'Identity changed during sign in');
+                if (user.totpEnabled) {
+                    const pending = id();
+                    await service.putFlow({ id: pending, kind: 'oidc-mfa', expires: Date.now() + 300000, data: { accountId: user.id, proof: externalProof.proof, browserHash: data.browserHash } });
+                    const browser = http.prepare(request);
+                    return pageResponse('Confirm second factor', `<form method="post" action="${escapeHtml(mount + '/providers/complete')}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(pending)}">${formField('totp', 'Authenticator code', 'text', 'one-time-code', false)}${formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false)}<button type="submit">Complete sign in</button></form>`, 200, browser.headers);
+                }
+                return finish(request, await service.issueSession(user.id, { device: http.device(request), method: 'oidc', proof: externalProof.proof }));
+            }
+            if (path === '/providers/enroll') {
+                if (request.method !== 'POST' || !registration || !options.enrollment)
+                    throw new AuthHttpError(404, 'Not found');
+                const fields = readFields(request, ['flowId', ...options.enrollment.names]);
+                http.verify(request, fields);
+                const data = record(await service.consumeFlow(fields.flowId || '', 'oidc-enrollment'));
+                checkBinding(data, http.cookie(request, flowCookie));
+                if (typeof data.email !== 'string' || typeof data.provider !== 'string' || typeof data.subject !== 'string')
+                    throw new AuthHttpError(400, 'Invalid enrollment');
+                const user = await service.createExternalAccount({ email: data.email, emailVerified: true, provider: data.provider, subject: data.subject, profile: options.enrollment.read(fields) });
+                const externalProof = await service.getExternalProof(data.provider, data.subject);
+                if (!externalProof || externalProof.user.id !== user.id)
+                    throw new AuthHttpError(401, 'Identity changed during enrollment');
+                return finish(request, await service.issueSession(user.id, { device: http.device(request), method: 'oidc', proof: externalProof.proof }));
+            }
+            if (path === '/providers/complete') {
+                if (request.method !== 'POST')
+                    throw new AuthHttpError(405, 'POST required');
+                const fields = readFields(request, ['flowId', 'totp', 'recoveryCode']);
+                http.verify(request, fields);
+                const data = record(await service.consumeFlow(fields.flowId || '', 'oidc-mfa'));
+                checkBinding(data, http.cookie(request, flowCookie));
+                if (typeof data.accountId !== 'string')
+                    throw new AuthHttpError(400, 'Invalid authentication flow');
+                return finish(request, await service.issueSession(data.accountId, { device: http.device(request), method: 'oidc', proof: record(data.proof) as unknown as NonNullable<Parameters<AuthService['issueSession']>[1]['proof']>, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) }));
+            }
+            const ceremony = /^\/passkeys\/(register|login|step-up)\/(options|verify)$/.exec(path);
+            if (!ceremony)
+                return undefined;
+            if (!options.passkeys)
+                throw new AuthHttpError(404, 'Not found');
+            if (request.method !== 'POST')
+                throw new AuthHttpError(405, 'POST required');
+            const body = complex(request);
+            if (Object.keys(body).some(key => !['csrf', 'flowId', 'response', 'totp', 'recoveryCode'].includes(key)))
+                throw new AuthHttpError(400, 'Unknown authentication field');
+            http.verify(request, typeof body.csrf === 'string' ? { csrf: body.csrf } : {});
+            const session = http.session(request), binding = session || http.cookie(request, http.flowCookie);
+            if (!binding)
+                throw new AuthHttpError(403, 'Browser flow required');
+            const kind = ceremony[1]!, phase = ceremony[2]!, actor = session ? await service.authenticate(session) : null;
+            if (kind === 'step-up' && (!session || !actor || actor.impersonatorId))
+                throw new AuthHttpError(401, 'Sign in required');
+            if (kind === 'register') {
+                if (!session || !actor)
+                    throw new AuthHttpError(401, 'Sign in required');
+                fresh(actor.authenticatedAt);
+            }
+            if (phase === 'options') {
+                const generated = kind === 'register' ? await options.passkeys.beginRegistration({ id: actor!.id, email: actor!.email }, await service.listPasskeys(actor!.id)) : await options.passkeys.beginAuthentication();
+                const flowId = id();
+                await service.putFlow({ id: flowId, kind: 'passkey-' + kind, expires: Date.now() + 300000, data: { challenge: generated.challenge, browserHash: hash(binding), ...(actor ? { accountId: actor.id } : {}) } });
+                return jsonResponse(200, { options: generated, flowId });
+            }
+            if (typeof body.flowId !== 'string')
+                throw new AuthHttpError(400, 'Flow ID required');
+            const data = record(await service.consumeFlow(body.flowId, 'passkey-' + kind));
+            checkBinding(data, binding);
+            if (typeof data.challenge !== 'string')
+                throw new AuthHttpError(400, 'Invalid challenge');
+            const response = record(body.response);
+            if (typeof response.id !== 'string')
+                throw new AuthHttpError(400, 'Invalid credential');
+            if (kind === 'register') {
+                if (data.accountId !== actor!.id)
+                    throw new AuthHttpError(403, 'Account changed during ceremony');
+                const credential = await options.passkeys.verifyRegistration(response as unknown as RegistrationResponseJSON, data.challenge);
+                await service.addPasskey({ actorToken: session!, credential });
+                return jsonResponse(200, { registered: true });
+            }
+            const stored = await service.getPasskey(response.id);
+            if (!stored)
+                throw new AuthHttpError(401, 'Passkey authentication failed');
+            if (kind === 'step-up' && (stored.accountId !== actor!.id || data.accountId !== actor!.id))
+                throw new AuthHttpError(403, 'Passkey belongs to another account');
+            const verified = await options.passkeys.verifyAuthentication(response as unknown as AuthenticationResponseJSON, data.challenge, stored.credential);
+            const proof = { ...stored.proof, newCounter: verified.counter };
+            if (body.totp !== undefined && typeof body.totp !== 'string' || body.recoveryCode !== undefined && typeof body.recoveryCode !== 'string')
+                throw new AuthHttpError(400, 'Invalid second factor');
+            if (kind === 'step-up')
+                return finish(request, await service.completeStepUp({ token: session!, accountId: stored.accountId, method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}) }));
+            return finish(request, await service.issueSession(stored.accountId, { device: http.device(request), method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}) }));
+        },
+    };
+}
