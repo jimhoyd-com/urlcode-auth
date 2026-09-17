@@ -1,3 +1,4 @@
+import { createSecondFactorFlows } from './second-factor-flows.ts';
 import { createPresentation } from './presentation.ts';
 import type { PresentationContext } from './presentation.ts';
 import type { Presentation } from './presentation.ts';
@@ -8,7 +9,7 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simp
 import type { AuthService, AuthSessionResult } from './auth-core.ts';
 import type { OidcProvider, OidcFlow } from './oidc.ts';
 import type { PasskeyProvider } from './passkeys.ts';
-import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, jsonResponse, pageResponse as renderPage, readFields, wantsJson } from './auth-ui.ts';
+import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, jsonResponse, pageResponse as renderPage, readFields, wantsJson, secondFactorButton } from './auth-ui.ts';
 import type { AuthHttpResponse } from './auth-ui.ts';
 export interface AuthFlowOptions {
     service: AuthService;
@@ -26,6 +27,7 @@ export interface AuthFlowOptions {
         names: string[];
     };
 }
+const trustedCookie = '__Host-urlcode-trusted-device';
 const defaultPresentation = createPresentation();
 const id = () => randomBytes(32).toString('base64url');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -57,6 +59,8 @@ function fresh(authenticatedAt: number): void {
 }
 export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount: string, registration: boolean) {
     const service = options.service, providers = options.providers || {}, flowCookie = '__Host-urlcode-oidc';
+    const secondFactors = createSecondFactorFlows(options, http, mount);
+    const trusted = (request: ExtensionRequest) => { const token = service.getSecurityPolicy().trustedDeviceTtlMs ? http.cookie(request, trustedCookie) : undefined; return token ? { trustedDevice: token } : {}; };
     if (Object.keys(providers).length > 16 || Object.keys(providers).some(name => !/^[a-z][a-z0-9-]{0,31}$/.test(name)))
         throw new Error('Invalid provider names');
     const cookie = (value: string, maxAge = 600): [
@@ -143,13 +147,21 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                 }
                 if (!externalProof || externalProof.user.id !== user.id)
                     throw new AuthHttpError(401, 'Identity changed during sign in');
-                if (user.totpEnabled) {
+                if (user.totpEnabled || user.passkeyMfaEnabled) {
+                    const extraHeaders: [string,string][] = [];
+                    if(trusted(request).trustedDevice) {
+                        try { return finish(request, await service.issueSession(user.id, {device:http.device(request),...trusted(request),method:'oidc',proof:externalProof.proof})); }
+                        catch(error) {
+                            if(!(error instanceof Error) || !('code' in error) || error.code!=='invalid_trusted_device')throw error;
+                            extraHeaders.push(['set-cookie',http.setCookie(trustedCookie,'',0)]);
+                        }
+                    }
                     const pending = id();
                     await service.putFlow({ id: pending, kind: 'oidc-mfa', expires: Date.now() + 300000, data: { accountId: user.id, proof: externalProof.proof, browserHash: data.browserHash, locale: presentation.locale } });
                     const browser = http.prepare(request);
-                    return pageResponse('Confirm second factor', `<form method="post" action="${escapeHtml(mount + '/providers/complete?lang=' + encodeURIComponent(presentation.locale))}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(pending)}">${formField('totp', 'Authenticator code', 'text', 'one-time-code', false)}${formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false)}<button type="submit">${tr("action.completeSignIn")}</button></form>`, 200, browser.headers);
+                    return pageResponse('Confirm second factor', `<form method="post" action="${escapeHtml(mount + '/providers/complete?lang=' + encodeURIComponent(presentation.locale))}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(pending)}">${formField('totp', 'Authenticator code', 'text', 'one-time-code', false)}${formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false)}${service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? secondFactorButton(mount, value => presentation.textSource(value)) : ''}<button type="submit">${tr("action.completeSignIn")}</button></form>`, 200, [...browser.headers,...extraHeaders], options.passkeys ? mount + '/assets/passkeys.js' : undefined);
                 }
-                return finish(request, await service.issueSession(user.id, { device: http.device(request), method: 'oidc', proof: externalProof.proof }));
+                return finish(request, await service.issueSession(user.id, { device: http.device(request), ...trusted(request), method: 'oidc', proof: externalProof.proof }));
             }
             if (path === '/providers/enroll') {
                 if (request.method !== 'POST' || !registration || !options.enrollment)
@@ -164,18 +176,18 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                 const externalProof = await service.getExternalProof(data.provider, data.subject);
                 if (!externalProof || externalProof.user.id !== user.id)
                     throw new AuthHttpError(401, 'Identity changed during enrollment');
-                return finish(request, await service.issueSession(user.id, { device: http.device(request), method: 'oidc', proof: externalProof.proof }));
+                return finish(request, await service.issueSession(user.id, { device: http.device(request), ...trusted(request), method: 'oidc', proof: externalProof.proof }));
             }
             if (path === '/providers/complete') {
                 if (request.method !== 'POST')
                     throw new AuthHttpError(405, 'POST required');
-                const fields = readFields(request, ['flowId', 'totp', 'recoveryCode']);
+                const fields = readFields(request, ['flowId', 'totp', 'recoveryCode', 'secondFactorToken']);
                 http.verify(request, fields);
                 const data = record(await service.consumeFlow(fields.flowId || '', 'oidc-mfa'));
                 checkBinding(data, http.cookie(request, flowCookie));
                 if (typeof data.accountId !== 'string')
                     throw new AuthHttpError(400, 'Invalid authentication flow');
-                return finish(request, await service.issueSession(data.accountId, { device: http.device(request), method: 'oidc', proof: record(data.proof) as unknown as NonNullable<Parameters<AuthService['issueSession']>[1]['proof']>, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) }));
+                return finish(request, await service.issueSession(data.accountId, { device: http.device(request), method: 'oidc', proof: record(data.proof) as unknown as NonNullable<Parameters<AuthService['issueSession']>[1]['proof']>, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...(fields.secondFactorToken ? { secondFactor: secondFactors.proof(request, fields.secondFactorToken) } : {}), ...trusted(request) }));
             }
             const ceremony = /^\/passkeys\/(register|login|step-up)\/(options|verify)$/.exec(path);
             if (!ceremony)
@@ -185,7 +197,7 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
             if (request.method !== 'POST')
                 throw new AuthHttpError(405, 'POST required');
             const body = complex(request);
-            if (Object.keys(body).some(key => !['csrf', 'flowId', 'response', 'totp', 'recoveryCode'].includes(key)))
+            if (Object.keys(body).some(key => !['csrf', 'flowId', 'response', 'totp', 'recoveryCode', 'secondFactorToken'].includes(key)))
                 throw new AuthHttpError(400, 'Unknown authentication field');
             http.verify(request, typeof body.csrf === 'string' ? { csrf: body.csrf } : {});
             const session = http.session(request), binding = session || http.cookie(request, http.flowCookie);
@@ -228,11 +240,12 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                 throw new AuthHttpError(403, 'Passkey belongs to another account');
             const verified = await options.passkeys.verifyAuthentication(response as unknown as AuthenticationResponseJSON, data.challenge, stored.credential);
             const proof = { ...stored.proof, newCounter: verified.counter };
+            if (body.secondFactorToken !== undefined && typeof body.secondFactorToken !== 'string') throw new AuthHttpError(400, 'Invalid second-factor proof');
             if (body.totp !== undefined && typeof body.totp !== 'string' || body.recoveryCode !== undefined && typeof body.recoveryCode !== 'string')
                 throw new AuthHttpError(400, 'Invalid second factor');
             if (kind === 'step-up')
-                return finish(request, await service.completeStepUp({ token: session!, accountId: stored.accountId, method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}) }));
-            return finish(request, await service.issueSession(stored.accountId, { device: http.device(request), method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}) }));
+                return finish(request, await service.completeStepUp({ token: session!, accountId: stored.accountId, method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}), ...(typeof body.secondFactorToken === 'string' && body.secondFactorToken ? { secondFactor: secondFactors.proof(request, body.secondFactorToken) } : {}) }));
+            return finish(request, await service.issueSession(stored.accountId, { device: http.device(request), ...trusted(request), method: 'passkey', proof, ...(typeof body.totp === 'string' && body.totp ? { totp: body.totp } : {}), ...(typeof body.recoveryCode === 'string' && body.recoveryCode ? { recoveryCode: body.recoveryCode } : {}), ...(typeof body.secondFactorToken === 'string' && body.secondFactorToken ? { secondFactor: secondFactors.proof(request, body.secondFactorToken) } : {}) }));
         },
     };
 }

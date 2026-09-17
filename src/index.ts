@@ -23,3 +23,6 @@ export type { AuthDailyMetric } from './auth-core.ts';
 export { createAuthPreset } from './presets.ts';
 export type { AuthPreset, AuthPresetOptions } from './presets.ts';
 export type { AuthRestriction, AuthSecurityPolicy } from './auth-core.ts';
+export { verifyDeployment } from './deployment-check.ts';
+export type { DeploymentCheckOptions, DeploymentCheckResult } from './deployment-check.ts';
+export type { ManualRecoveryService, ManualRecoveryCase, ManualRecoveryDelivery, ManualRecoveryEvidence } from './manual-recovery.ts';

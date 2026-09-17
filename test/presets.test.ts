@@ -11,7 +11,7 @@ test('operator presets wire capabilities and refuse incomplete hardened configur
     assert.equal(standard.extension.sendToken, undefined);
     assert.equal(standard.notices.length, 1);
     assert.throws(() => createAuthPreset({ ...base, preset: 'hardened' }), /requires/);
-    const sender: EmailSender = Object.assign(async () => { }, { async notify() { }, async sendEmailCode() { }, async sendSignupCode() { }, async sendFactorRecovery() { }, close() { } });
+    const sender: EmailSender = Object.assign(async () => { }, { async notify() { }, async sendEmailCode() { }, async sendSignupCode() { }, async sendFactorRecovery() { }, async sendManualRecovery() { }, close() { } });
     assert.throws(() => createAuthPreset({ ...base, preset: 'hardened', sender }), /requires/);
     const checkPassword = async () => { }, hardened = createAuthPreset({ ...base, preset: 'hardened', sender, checkPassword });
     assert.equal(hardened.service.requireMfa, true);

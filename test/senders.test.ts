@@ -118,3 +118,19 @@ test('factor recovery mail has separate fixed-origin confirmation and cancellati
     assert.equal(rows.length, 1);
     deliver.close();
 });
+
+test('manual recovery warns the old address before sending a restoration link and stops on warning failure', async () => {
+    const rows: { email: string; text: string }[] = [];
+    const deliver = createSesSender({ ...base, region: 'us-east-1', from: 'operator@example.test', transport: async command => { rows.push({ email: command.input.Destination!.ToAddresses![0]!, text: command.input.Content!.Simple!.Body!.Text!.Data! }); } });
+    await deliver.sendManualRecovery({ email: 'new@example.test', oldEmail: 'old@example.test', token: 'a'.repeat(43), caseId: 'case', signal: message().signal });
+    assert.equal(rows[0]!.email, 'old@example.test');
+    assert.ok(!rows[0]!.text.includes('token='));
+    assert.equal(rows[1]!.email, 'new@example.test');
+    assert.ok(rows[1]!.text.includes('/account/restore-access?token=' + 'a'.repeat(43)));
+    deliver.close();
+    let calls = 0;
+    const failing = createSesSender({ ...base, region: 'us-east-1', from: 'operator@example.test', transport: async () => { calls++; throw new Error('Unavailable'); } });
+    await assert.rejects(failing.sendManualRecovery({ email: 'new@example.test', oldEmail: 'old@example.test', token: 'a'.repeat(43), caseId: 'case', signal: message().signal }));
+    assert.equal(calls, 1);
+    failing.close();
+});

@@ -25,7 +25,8 @@
     "README.md",
     "LICENSE",
     "SECURITY.md",
-    "IMPLEMENTATION-STATUS.md"
+    "IMPLEMENTATION-STATUS.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "devDependencies": {
     "@types/node": "26.5.1",

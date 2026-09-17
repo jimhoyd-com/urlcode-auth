@@ -134,3 +134,41 @@ application authority returns until the replacement factor is confirmed. Recover
 state expires, is rate-limited, survives restart and is revoked by configuration
 migration. This is email-based factor recovery, not proof of a person's legal
 identity or the later public lost-everything workflow.
+
+### Anonymous deployment checks
+
+Run `urlcode-auth verify-deployment` with bounded JSON on stdin containing the
+canonical HTTPS `origin` and `authMount`. It performs two anonymous GET requests,
+checks the expected login/unauthenticated account status, restrictive CSP,
+no-store/no-referrer/nosniff headers, and secure host-only cookies. It does not send
+credentials, follow redirects, read response bodies, send email or create accounts.
+A failed check exits nonzero and prints only named booleans, never response bodies
+or network errors. `allowDevelopment: true` permits HTTP only for loopback hosts.
+These checks cover the observed public responses; they do not establish live
+provider readiness, security assessment, recovery or load-test results.
+
+### Passkey second factors and remembered devices
+
+Set `allowPasskeySecondFactor: true` to let a user explicitly enroll an owned,
+user-verified passkey as a second factor at `/account/second-factors`. A passkey
+used for primary sign-in cannot also satisfy the second factor in that sign-in.
+WebAuthn challenges bind to the browser; opaque factor proofs are consumed with
+the primary credential, account version and counter in the final transaction.
+TOTP/recovery-code alternatives remain available. Restricted enrollment may add a
+factor through a narrowly scoped path, including the recovery-session grant.
+
+Set `trustedDeviceTtlMs` (at most 30 days; default disabled) to offer
+`/account/trusted-devices`. Remembering a device requires recent actual MFA and an
+explicit user action. It creates a separate Secure, HttpOnly, host-only cookie;
+ordinary device recognition is never an MFA exemption. Remembered sign-in has no
+fresh authentication timestamp and cannot satisfy admin/credential step-up or mint
+another exemption. Users can revoke individual remembered devices; account
+security/version changes invalidate them. These options are part of the pinned
+operator configuration and require the explicit migration workflow when changed.
+
+`blockDisposableEmails: true` optionally refuses new registrations using the
+bundled disposable-domain snapshot, including subdomains. The dataset revision is
+part of the configuration fingerprint. Existing-account login/recovery is not
+blocked by this policy. Exact operator allow/block lists still apply. The snapshot
+is fallible and may reject legitimate addresses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for provenance and CC0 data terms.

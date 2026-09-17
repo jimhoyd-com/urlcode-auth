@@ -5,13 +5,14 @@ import type { PresentationContext } from './presentation.ts';
 import type { RegistrationInput, MetadataValue } from './registration.ts';
 import { isHoneypotFilled } from './registration.ts';
 import type { Presentation } from './presentation.ts';
+import { createSecondFactorFlows } from './second-factor-flows.ts';
 import { createSignup } from './auth-signup.ts';
 import { createAuthFlows } from './auth-flows.ts';
 import type { OidcProvider } from './oidc.ts';
 import type { PasskeyProvider } from './passkeys.ts';
 import type { RuntimeExtension, ExtensionRequest } from '@jimhoyd/urlcode/extensions';
 import type { AuthService, AuthPrincipal, AuthUser } from './auth-core.ts';
-import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, httpFailure, jsonResponse, pageResponse as renderPage, readFields, wantsJson, passkeyScript } from './auth-ui.ts';
+import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, httpFailure, jsonResponse, pageResponse as renderPage, readFields, wantsJson, passkeyScript, secondFactorButton } from './auth-ui.ts';
 import type { AuthHttpResponse } from './auth-ui.ts';
 export interface AuthExtensionOptions {
     sendFactorRecovery?:(message:FactorRecoveryMessage)=>Promise<void>;
@@ -83,6 +84,9 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                 return { ...(fields.displayName !== undefined ? { displayName: fields.displayName } : {}), ...(fields.locale ? { locale: fields.locale } : {}), ...(Object.keys(metadata).length ? { metadata } : {}), ...(fields.termsAccepted !== undefined ? { termsAccepted: fields.termsAccepted === 'true' } : {}) };
             }
             const profileMarkup = (formField: typeof baseField = baseField, presentation?: PresentationContext) => formField('displayName', 'Display name', 'text', 'nickname', false) + formField('locale', 'Preferred language', 'text', 'language', false) + metadataFields.map(([name, field]) => baseField('meta.' + name, name + (field.type === 'boolean' ? ' (' + (presentation?.text('field.booleanHint') ?? 'true or false') + ')' : ''), field.type === 'number' ? 'number' : 'text', 'off', field.required === true)).join('') + (registrationSchema.termsVersion ? `<label><input type="checkbox" name="termsAccepted" value="true" required> ${escapeHtml((presentation ?? defaultPresentation.resolve()).text('message.acceptTerms', { version: registrationSchema.termsVersion }))}</label>` : '');
+            const secondFactors = createSecondFactorFlows(options, http, mount);
+            const trustedCookie = '__Host-urlcode-trusted-device';
+            const trusted = (request: ExtensionRequest) => { const token = service.getSecurityPolicy().trustedDeviceTtlMs ? http.cookie(request, trustedCookie) : undefined; return token ? {trustedDevice:token} : {}; };
             const flows = createAuthFlows({ ...options, onSession: async (request, result) => {
                     if (result.newDevice)
                         await notice(result.user.email, 'new-device');
@@ -105,7 +109,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                 string,
                 string
             ][] = []): AuthHttpResponse { return jsonResponse(303, { redirect: path }, [['location', path], ...headers]); }
-            const createNavigation = (text: (value: string) => string) => `<nav aria-label="${escapeHtml(text('Account'))}">${[['account', 'Account'], ['sessions', 'Sessions'], ['step-up', 'Confirm identity'], ['methods', 'Sign-in methods']].map(([path, label]) => `<a href="${escapeHtml(mount + '/' + path)}">${escapeHtml(text(label!))}</a>`).join('')}</nav>`;
+            const createNavigation = (text: (value: string) => string) => `<nav aria-label="${escapeHtml(text('Account'))}">${[['account', 'Account'], ['sessions', 'Sessions'], ['step-up', 'Confirm identity'], ['methods', 'Sign-in methods'], ...(service.getSecurityPolicy().allowPasskeySecondFactor ? [['second-factors','Second factors']] : []), ...(service.getSecurityPolicy().trustedDeviceTtlMs ? [['trusted-devices','Remembered devices']] : [])].map(([path, label]) => `<a href="${escapeHtml(mount + '/' + path)}">${escapeHtml(text(label!))}</a>`).join('')}</nav>`;
             async function deliver(email: string, token: string, purpose: 'verify-email' | 'reset-password' | 'cancel-deletion' | 'verify-email-change' | 'cancel-email-change', strict = false): Promise<void> {
                 if (!options.sendToken)
                     throw new AuthHttpError(503, 'Email delivery is not configured');
@@ -180,25 +184,26 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                     const tr = (key: string, values?: Readonly<Record<string, string | number>>) => escapeHtml(presentation.text(key, values));
                     const text = (value: string) => presentation?.textSource(value) ?? value;
                     const navigation = createNavigation(source => presentation?.textSource(source) ?? source);
-                    const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4], presentation] as Parameters<typeof renderPage>);
+                    const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4] ?? (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? mount + '/assets/passkeys.js' : undefined), presentation] as Parameters<typeof renderPage>);
                     const formField = (name: string, label: string, type = 'text', autocomplete = 'off', required = true) => baseField(name, presentation?.textSource(label) ?? label, type, autocomplete, required);
                     const form = (action: string, csrf: string, fields: string, button: string) => renderForm(action + (action.includes('?') ? '&' : '?') + 'lang=' + encodeURIComponent(presentation.locale), csrf, fields, presentation?.textSource(button) ?? button);
                     const profileFields = () => profileMarkup(formField, presentation);
                     const credentials = () => formField('email', 'Email address', 'email', 'username') + formField('password', 'Password', 'password', 'current-password');
-                    const factors = () => formField('totp', 'Authenticator code (if enabled)', 'text', 'one-time-code', false) + formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false);
+                    const factors = () => formField('totp', 'Authenticator code (if enabled)', 'text', 'one-time-code', false) + formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false) + (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? secondFactorButton(mount,text) : '');
+                    const passkeyLogin = (csrf: string) => options.passkeys ? `<form method="post" action="${escapeHtml(mount+'/login')}">${csrfField(csrf)}<fieldset><legend>${escapeHtml(text('Passkey sign-in'))}</legend><p>${escapeHtml(text('If your account uses a second factor, confirm it before choosing your sign-in passkey.'))}</p>${factors()}${passkeyButton('login',text)}</fieldset></form>` : '';
                     try {
                         const path = request.path.slice(mount.length) || '/';
                         const recovered=await factorRecovery.handle(request,presentation);if(recovered)return recovered;
                         const sessionToken = http.session(request), sessionPrincipal = sessionToken ? await service.authenticate(sessionToken) : null;
                         if (sessionPrincipal && enrollmentRequired(sessionPrincipal)) {
-                            const enrollmentPaths = new Set(['/account', '/csrf', '/logout', '/verify', '/send-verification', '/totp/begin', '/totp/confirm', '/login', '/identify', '/step-up', '/assets/passkeys.js', '/email-code', '/send-email-code', '/providers/complete']);
-                            const proofRenewal = /^\/passkeys\/(?:login|step-up)\/(?:options|verify)$/.test(path) || /^\/providers\/[a-z][a-z0-9-]{0,31}\/(?:start|callback)$/.test(path);
+                            const enrollmentPaths = new Set(['/account', '/csrf', '/logout', '/verify', '/send-verification', '/totp/begin', '/totp/confirm', '/login', '/identify', '/step-up', '/assets/passkeys.js', '/email-code', '/send-email-code', '/providers/complete', '/second-factors', '/passkeys/second-factor', '/second-factor/options', '/second-factor/verify']);
+                            const proofRenewal = /^\/passkeys\/(?:login|step-up|register)\/(?:options|verify)$/.test(path) || /^\/providers\/[a-z][a-z0-9-]{0,31}\/(?:start|callback)$/.test(path);
                             if (!enrollmentPaths.has(path) && !proofRenewal) {
                                 if (['GET', 'HEAD'].includes(request.method) && !wantsJson(request))
                                     return redirect(mount + '/account');
                                 return jsonResponse(403, { error: 'Complete required account enrollment', restrictions: sessionPrincipal.restrictions });
                             }
-                            if (sessionPrincipal.restrictions?.includes('verify-email') && (path === '/totp/begin' || path === '/totp/confirm'))
+                            if (sessionPrincipal.restrictions?.includes('verify-email') && (path === '/totp/begin' || path === '/totp/confirm' || path === '/second-factors' || path === '/passkeys/second-factor' || path.startsWith('/passkeys/register/')))
                                 throw new AuthHttpError(403, 'Verify your email before enrolling an authenticator');
                         }
                         if (path === '/register' && request.method !== 'POST' && ['open','invite-only','waitlist'].includes(registrationMode)) {
@@ -210,6 +215,8 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return redirect(mount + '/signup' + (query.size ? '?' + query : ''));
                         }
                         if (path === '/register' && request.method === 'POST' && service.getSecurityPolicy().requireEmailVerification) throw new AuthHttpError(403, 'Complete verified signup first');
+                        const secondFactorResult = await secondFactors.handle(request);
+                        if (secondFactorResult) return secondFactorResult;
                         const signupResult = await signup(request, presentation);
                         if (signupResult) return signupResult;
                         const flowResult = await flows.handle(request);
@@ -224,7 +231,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             if (path === '/csrf')
                                 return jsonResponse(200, { csrf }, headers);
                             if (path === '/' || path === '/login')
-                                return pageResponse('Sign in', form(mount + '/identify', csrf, formField('email', 'Email address', 'email', 'username'), 'Continue') + passkeyButton('login', text) + flows.buttons(csrf, false, text, presentation.locale, presentation) + `<nav>${registrationMode !== 'off' ? `<a href="${escapeHtml(mount + '/register')}">${tr("action.register")}</a>` : ''}${factorRecovery.enabled()?` <a href="${escapeHtml(mount+'/recover-factor')}">${tr("recovery.lost")}</a>`:''}${options.sendToken ? ` <a href="${escapeHtml(mount + '/forgot-password')}">${tr("nav.forgotPassword")}</a>` : ''}${options.sendEmailCode ? ` <a href="${escapeHtml(mount + '/email-code')}">${tr("copy.emailSignIn")}</a>` : ''}</nav>`, 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                                return pageResponse('Sign in', form(mount + '/identify', csrf, formField('email', 'Email address', 'email', 'username'), 'Continue') + passkeyLogin(csrf) + flows.buttons(csrf, false, text, presentation.locale, presentation) + `<nav>${registrationMode !== 'off' ? `<a href="${escapeHtml(mount + '/register')}">${tr("action.register")}</a>` : ''}${factorRecovery.enabled()?` <a href="${escapeHtml(mount+'/recover-factor')}">${tr("recovery.lost")}</a>`:''}${options.sendToken ? ` <a href="${escapeHtml(mount + '/forgot-password')}">${tr("nav.forgotPassword")}</a>` : ''}${options.sendEmailCode ? ` <a href="${escapeHtml(mount + '/email-code')}">${tr("copy.emailSignIn")}</a>` : ''}</nav>`, 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
                             if (path === '/register') {
                                 const invitations = request.query.getAll('token');
                                 if (invitations.length > 1 || invitations.some(token => token.length > 512))
@@ -273,11 +280,24 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                     return jsonResponse(200, { user, csrf, ...(current.principal.restrictions ? { restrictions: current.principal.restrictions } : {}), ...(current.principal.impersonatorId ? { impersonatorId: current.principal.impersonatorId } : {}) }, headers);
                                 if (enrollmentRequired(current.principal)) {
                                     const needsEmail = current.principal.restrictions!.includes('verify-email');
-                                    return pageResponse('Complete account enrollment', `<p role="status">${tr("copy.applicationAccessRemainsBlockedUntilAllRequiredEnrollmentStepsAreComplete")}</p><p>${escapeHtml(user.email)}</p>` + (needsEmail ? `<h2>${tr("copy.verifyYourEmailFirst")}</h2>` + (options.sendToken ? form(mount + '/send-verification', csrf, '', 'Send verification email') : `<p>${tr("copy.emailDeliveryIsUnavailableContactTheSiteOperator")}</p>`) : `<h2>${tr("copy.enrollAnAuthenticator")}</h2>` + form(mount + '/totp/begin', csrf, '', 'Set up authenticator')) + `<p><a href="${escapeHtml(mount + '/step-up')}">${tr("page.stepUp")}</a> ${tr("copy.ifYourRecentSignInHasExpired")}</p>` + form(mount + '/logout', csrf, '', 'Sign out'), 200, headers);
+                                    return pageResponse('Complete account enrollment', `<p role="status">${tr("copy.applicationAccessRemainsBlockedUntilAllRequiredEnrollmentStepsAreComplete")}</p><p>${escapeHtml(user.email)}</p>` + (needsEmail ? `<h2>${tr("copy.verifyYourEmailFirst")}</h2>` + (options.sendToken ? form(mount + '/send-verification', csrf, '', 'Send verification email') : `<p>${tr("copy.emailDeliveryIsUnavailableContactTheSiteOperator")}</p>`) : `<h2>${tr("copy.enrollAnAuthenticator")}</h2>` + form(mount + '/totp/begin', csrf, '', 'Set up authenticator') + (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? `<p><a href="${escapeHtml(mount+'/second-factors')}">${escapeHtml(text('Set up a passkey second factor'))}</a></p>` : '')) + `<p><a href="${escapeHtml(mount + '/step-up')}">${tr("page.stepUp")}</a> ${tr("copy.ifYourRecentSignInHasExpired")}</p>` + form(mount + '/logout', csrf, '', 'Sign out'), 200, headers);
                                 }
                                 if (current.principal.impersonatorId)
                                     return pageResponse('Support impersonation', navigation + `<p role="alert">${tr("copy.youAreViewingThisAccountAsASupportAdministratorAccountSecurityChangesAreDisabledEndImpersonationToSignInAsYour")}</p>` + form(mount + '/logout', csrf, '', 'End impersonation'), 200, headers);
-                                return pageResponse('Your account', navigation + `<p>${escapeHtml(user.email)}</p><p>${tr('message.accountState', { email: presentation.text(user.emailVerified ? 'state.verified' : 'state.unverified'), authenticator: presentation.text(user.totpEnabled ? 'state.enabled' : 'state.disabled') })}</p>` + form(mount + '/logout', csrf, '', 'Sign out') + (options.sendToken && !user.emailVerified ? form(mount + '/send-verification', csrf, '', 'Send verification email') : '') + form(mount + '/totp/begin', csrf, '', 'Set up authenticator') + form(mount + '/totp/disable', csrf, formField('password', 'Password', 'password', 'current-password') + formField('code', 'Authenticator code', 'text', 'one-time-code'), 'Disable authenticator') + (options.sendToken ? form(mount + '/change-email', csrf, formField('email', 'New email address', 'email', 'email') + formField('password', 'Current password (if configured)', 'password', 'current-password', false) + factors(), 'Request email change (24-hour cooling period)') : '') + form(mount + '/profile', csrf, profileFields(), 'Update profile') + form(mount + '/change-password', csrf, formField('currentPassword', 'Current password', 'password', 'current-password') + formField('password', 'New password', 'password', 'new-password') + factors(), 'Change password and sign out all sessions') + form(mount + '/export', csrf, '', 'Export account data') + (options.sendToken ? form(mount + '/delete', csrf, `<p>${tr('message.deletionGrace', { days: service.getSecurityPolicy().deletionGraceMs / 86400000 })}</p>` + formField('confirmation', 'Type DELETE to confirm') + formField('password', 'Password (if configured)', 'password', 'current-password', false) + factors(), 'Schedule account deletion') : '') + passkeyButton('register', text) + flows.buttons(csrf, true, text, presentation.locale, presentation), 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                                return pageResponse('Your account', navigation + `<p>${escapeHtml(user.email)}</p><p>${tr('message.accountState', { email: presentation.text(user.emailVerified ? 'state.verified' : 'state.unverified'), authenticator: presentation.text(user.totpEnabled ? 'state.enabled' : 'state.disabled') })}</p>` + form(mount + '/logout', csrf, '', 'Sign out') + (options.sendToken && !user.emailVerified ? form(mount + '/send-verification', csrf, '', 'Send verification email') : '') + form(mount + '/totp/begin', csrf, '', 'Set up authenticator') + form(mount + '/totp/disable', csrf, formField('password', 'Password (if configured)', 'password', 'current-password', false) + formField('code', 'Authenticator code', 'text', 'one-time-code', false) + (service.getSecurityPolicy().allowPasskeySecondFactor && options.passkeys ? secondFactorButton(mount,text) : ''), 'Disable authenticator') + (options.sendToken ? form(mount + '/change-email', csrf, formField('email', 'New email address', 'email', 'email') + formField('password', 'Current password (if configured)', 'password', 'current-password', false) + factors(), 'Request email change (24-hour cooling period)') : '') + form(mount + '/profile', csrf, profileFields(), 'Update profile') + form(mount + '/change-password', csrf, formField('currentPassword', 'Current password', 'password', 'current-password') + formField('password', 'New password', 'password', 'new-password') + factors(), 'Change password and sign out all sessions') + form(mount + '/export', csrf, '', 'Export account data') + (options.sendToken ? form(mount + '/delete', csrf, `<p>${tr('message.deletionGrace', { days: service.getSecurityPolicy().deletionGraceMs / 86400000 })}</p>` + formField('confirmation', 'Type DELETE to confirm') + formField('password', 'Password (if configured)', 'password', 'current-password', false) + factors(), 'Schedule account deletion') : '') + passkeyButton('register', text) + flows.buttons(csrf, true, text, presentation.locale, presentation), 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                            }
+                            if(path==='/second-factors') {
+                                if(!service.getSecurityPolicy().allowPasskeySecondFactor || !options.passkeys)throw new AuthHttpError(404,'Not found');
+                                const keys=await service.listPasskeys(current.principal.id);
+                                const passkeys=keys.map(key=>({id:key.id,secondFactor:key.secondFactor===true}));
+                                if(wantsJson(request))return jsonResponse(200,{passkeys,csrf},headers);
+                                return pageResponse('Second factors',navigation+csrfField(csrf)+`<p>${escapeHtml(text('A second-factor passkey must be different from the passkey used for primary sign-in.'))}</p>`+passkeyButton('register',text)+passkeys.map(key=>`<section><h2>${escapeHtml(key.id)}</h2><p>${escapeHtml(text(key.secondFactor?'Enabled':'Disabled'))}</p>`+form(mount+'/passkeys/second-factor',csrf,hidden('credentialId',key.id)+hidden('enabled',key.secondFactor?'false':'true')+(key.secondFactor?'':secondFactorButton(mount,text)),key.secondFactor?'Disable passkey second factor':'Enable passkey second factor')+'</section>').join(''),200,headers,mount+'/assets/passkeys.js');
+                            }
+                            if(path==='/trusted-devices') {
+                                if(!service.getSecurityPolicy().trustedDeviceTtlMs)throw new AuthHttpError(404,'Not found');
+                                const devices=await service.listTrustedDevices(current.token);
+                                if(wantsJson(request))return jsonResponse(200,{devices,csrf},headers);
+                                return pageResponse('Remembered devices',navigation+`<p>${escapeHtml(text('Remembering a device requires a real second factor. Sensitive actions still require fresh verification.'))}</p>`+form(mount+'/trusted-devices/remember',csrf,formField('label','Device label','text','off',false),'Remember this device')+devices.map(device=>`<section><h2>${escapeHtml(device.label)}</h2><p>${escapeHtml(new Date(device.expires).toISOString())}</p>`+form(mount+'/trusted-devices/revoke',csrf,hidden('deviceId',device.id),'Forget device')+'</section>').join(''),200,headers);
                             }
                             if (path === '/sessions') {
                                 const sessions = await service.listSessions(current.principal.id);
@@ -295,13 +315,14 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                 return pageResponse('Confirm your identity', navigation + form(mount + '/step-up', csrf, formField('password', 'Password', 'password', 'current-password') + factors(), 'Confirm identity') + passkeyButton('step-up', text), 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
                             throw new AuthHttpError(404, 'Not found');
                         }
-                        const fields = readFields(request, ['email', 'password', 'currentPassword', 'confirmation', 'invitationToken', 'totp', 'recoveryCode', 'token', 'code', 'sessionId', 'credentialId', 'provider', 'subject', 'flowId', 'displayName', 'locale', 'termsAccepted', 'website', ...metadataFields.map(([name]) => 'meta.' + name)]);
+                        const fields = readFields(request, ['email', 'password', 'currentPassword', 'confirmation', 'invitationToken', 'totp', 'recoveryCode', 'token', 'code', 'sessionId', 'credentialId', 'provider', 'subject', 'flowId', 'displayName', 'locale', 'termsAccepted', 'website', 'secondFactorToken', 'enabled', 'deviceId', 'label', ...metadataFields.map(([name]) => 'meta.' + name)]);
                         http.verify(request, fields);
+                        const secondFactor = fields.secondFactorToken ? {secondFactor:secondFactors.proof(request,fields.secondFactorToken)} : {};
                         if (path === '/identify') {
                             const email = fields.email || '';
                             if (email.length > 320 || !email.includes('@'))
                                 throw new AuthHttpError(400, 'Enter an email address');
-                            return pageResponse('Sign in', form(mount + '/login', fields.csrf || '', `<label>${tr("field.email")}<input name="email" type="email" autocomplete="username" value="${escapeHtml(email)}" readonly></label>` + formField('password', 'Password', 'password', 'current-password') + factors(), 'Sign in') + passkeyButton('login', text) + flows.buttons(fields.csrf || '', false, text, presentation.locale, presentation), 200, [], options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                            return pageResponse('Sign in', form(mount + '/login', fields.csrf || '', `<label>${tr("field.email")}<input name="email" type="email" autocomplete="username" value="${escapeHtml(email)}" readonly></label>` + formField('password', 'Password', 'password', 'current-password') + factors(), 'Sign in') + passkeyLogin(fields.csrf || '') + flows.buttons(fields.csrf || '', false, text, presentation.locale, presentation), 200, [], options.passkeys ? mount + '/assets/passkeys.js' : undefined);
                         }
                         if (path === '/login' || path === '/register') {
                             if (path === '/register' && isHoneypotFilled(fields.website))
@@ -313,7 +334,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                 return jsonResponse(202, { message: presentation.textSource('Registration request received.') });
                             }
                             const device = http.device(request);
-                            const result = path === '/register' ? await service.register({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, profile: profileInput(fields), ...(fields.invitationToken ? { invitationToken: fields.invitationToken } : {}) }) : await service.login({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            const result = path === '/register' ? await service.register({ email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, profile: profileInput(fields), ...(fields.invitationToken ? { invitationToken: fields.invitationToken } : {}) }) : await service.login({ ...trusted(request), email: fields.email || '', password: fields.password || '', device: { id: device.id, label: device.label }, ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             if (result.newDevice)
                                 await notice(result.user.email, 'new-device');
                             return wantsJson(request) ? jsonResponse(path === '/register' ? 201 : 200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
@@ -340,7 +361,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             if (!options.sendEmailCode)
                                 throw new AuthHttpError(404, 'Not found');
                             const device = http.device(request);
-                            const result = await service.consumeEmailCode({ device: { id: device.id, label: device.label }, flowId: fields.flowId || '', code: fields.code || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            const result = await service.consumeEmailCode({ ...trusted(request), device: { id: device.id, label: device.label }, flowId: fields.flowId || '', code: fields.code || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             if (result.newDevice)
                                 await notice(result.user.email, 'new-device');
                             return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), ...device.headers]) : redirect(mount + '/account', [...http.sessionHeaders(result.token), ...device.headers]);
@@ -374,6 +395,21 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                         const current = await principal(request);
                         if (current.principal.impersonatorId && path !== '/logout')
                             throw new AuthHttpError(403, 'Security changes are disabled during impersonation');
+                        if(path==='/passkeys/second-factor') {
+                            if(fields.enabled!=='true'&&fields.enabled!=='false')throw new AuthHttpError(400,'Invalid factor setting');
+                            await service.setPasskeySecondFactor({token:current.token,credentialId:fields.credentialId||'',enabled:fields.enabled==='true',...secondFactor});
+                            return wantsJson(request)?jsonResponse(200,{updated:true}):redirect(mount+'/second-factors');
+                        }
+                        if(path==='/trusted-devices/remember') {
+                            const device=await service.rememberDevice({token:current.token,...(fields.label?{label:fields.label}:{})});
+                            const headers:[string,string][]=[['set-cookie',http.setCookie(trustedCookie,device.token,Math.max(0,Math.min(2592000,Math.floor((device.expires-Date.now())/1000))))]];
+                            return wantsJson(request)?jsonResponse(200,{remembered:true,expires:device.expires},headers):redirect(mount+'/trusted-devices',headers);
+                        }
+                        if(path==='/trusted-devices/revoke') {
+                            await service.revokeTrustedDevice({token:current.token,deviceId:fields.deviceId||''});
+                            const headers:[string,string][]=[['set-cookie',http.setCookie(trustedCookie,'',0)]];
+                            return wantsJson(request)?jsonResponse(200,{revoked:true},headers):redirect(mount+'/trusted-devices',headers);
+                        }
                         if (path === '/passkeys/remove') {
                             await service.removePasskey({ token: current.token, credentialId: fields.credentialId || '' });
                             return jsonResponse(200, { removed: true });
@@ -385,7 +421,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                         if (path === '/change-email') {
                             if (!options.sendToken)
                                 throw new AuthHttpError(503, 'Email delivery required');
-                            const change = await service.requestEmailChange({ token: current.token, email: fields.email || '', ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            const change = await service.requestEmailChange({ token: current.token, email: fields.email || '', ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             try {
                                 await deliver(change.oldEmail, change.cancelToken, 'cancel-email-change', true);
                                 await deliver(change.newEmail, change.verificationToken, 'verify-email-change', true);
@@ -405,7 +441,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                         if (path === '/export')
                             return jsonResponse(200, await service.exportAccount(current.token), [['content-disposition', 'attachment; filename="account.json"']]);
                         if (path === '/change-password') {
-                            await service.changePassword({ token: current.token, currentPassword: fields.currentPassword || '', password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            await service.changePassword({ token: current.token, currentPassword: fields.currentPassword || '', password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             await notice(current.principal.email);
                             return jsonResponse(200, { changed: true }, http.clearSession());
                         }
@@ -414,7 +450,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                                 throw new AuthHttpError(503, 'Email delivery is required for deletion recovery');
                             if (fields.confirmation !== 'DELETE')
                                 throw new AuthHttpError(400, 'Deletion confirmation required');
-                            const result = await service.deleteAccount({ token: current.token, ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            const result = await service.deleteAccount({ token: current.token, ...(fields.password ? { password: fields.password } : {}), ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             await deliver(current.principal.email, result.cancelToken, 'cancel-deletion');
                             return jsonResponse(200, { deletionScheduled: true, deleteAfter: result.deleteAfter, cancellationDays: service.getSecurityPolicy().deletionGraceMs / 86400000 }, http.clearSession());
                         }
@@ -427,7 +463,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return jsonResponse(200, { signedOut: true }, http.clearSession());
                         }
                         if (path === '/step-up') {
-                            const result = await service.stepUp({ token: current.token, password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}) });
+                            const result = await service.stepUp({ token: current.token, password: fields.password || '', ...(fields.totp ? { totp: fields.totp } : {}), ...(fields.recoveryCode ? { recoveryCode: fields.recoveryCode } : {}), ...secondFactor });
                             return wantsJson(request) ? jsonResponse(200, { confirmed: true, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, http.sessionHeaders(result.token)) : redirect(mount + '/account', http.sessionHeaders(result.token));
                         }
                         if (path === '/send-verification') {
@@ -445,7 +481,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             return wantsJson(request) ? jsonResponse(200, enrolled) : pageResponse('Save your recovery codes', `<p>${tr("copy.storeTheseCodesSecurelyEachCanBeUsedOnce")}</p><ul>${enrolled.recoveryCodes.map(code => `<li><code>${escapeHtml(code)}</code></li>`).join('')}</ul><a href="${escapeHtml(mount + '/account')}">${tr("copy.continueToYourAccount")}</a>`);
                         }
                         if (path === '/totp/disable') {
-                            await service.disableTotp({ token: current.token, password: fields.password || '', code: fields.code || '' });
+                            await service.disableTotp({ token: current.token, password: fields.password || '', code: fields.code || '', ...secondFactor });
                             return jsonResponse(200, { disabled: true });
                         }
                         throw new AuthHttpError(404, 'Not found');

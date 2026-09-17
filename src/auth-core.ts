@@ -1,4 +1,5 @@
-import type {FactorRecoveryService} from './factor-recovery.ts';
+import { isDisposableEmailDomain, disposableDomainsRevision } from './disposable-domains.ts';
+import type { FactorRecoveryService } from './factor-recovery.ts';
 import { randomBytes, randomInt, randomUUID, createHash, createHmac, createCipheriv, createDecipheriv, scrypt, pbkdf2, timingSafeEqual } from 'node:crypto';
 import { compare as bcryptCompare } from 'bcryptjs';
 import { domainToASCII } from 'node:url';
@@ -16,11 +17,18 @@ export interface AuthUser {
     roles: string[];
     created: number;
     totpEnabled: boolean;
+    passkeyMfaEnabled?: boolean;
     profile?: RegistrationProfile;
 }
 export type AuthRestriction = 'verify-email' | 'enroll-mfa';
+export interface AuthSecondFactor {
+    token: string;
+    browserHash: string;
+}
 export interface AuthSecurityPolicy {
-    allowEmailFactorRecovery?:true;
+    allowPasskeySecondFactor?: true;
+    trustedDeviceTtlMs?: number;
+    allowEmailFactorRecovery?: true;
     requireEmailVerification: boolean;
     requireMfa: boolean;
     deletionGraceMs: number;
@@ -100,8 +108,11 @@ export interface AuthHookStats {
     timedOut: number;
 }
 export interface AuthOptions {
+    blockDisposableEmails?: boolean;
+    allowPasskeySecondFactor?: boolean;
+    trustedDeviceTtlMs?: number;
     /** Explicit email fallback lowers MFA assurance; disabled by default. */
-    allowEmailFactorRecovery?:boolean;
+    allowEmailFactorRecovery?: boolean;
     approveConfigurationChangeFrom?: string;
     configurationTag?: string;
     requireEmailVerification?: boolean;
@@ -131,6 +142,8 @@ export interface AuthOptions {
     blockedEmailDomains?: string[];
 }
 export interface AuthCredentials {
+    secondFactor?: AuthSecondFactor;
+    trustedDevice?: string;
     device?: AuthDevice;
     email: string;
     password: string;
@@ -138,6 +151,7 @@ export interface AuthCredentials {
     recoveryCode?: string;
 }
 export interface AuthPasskey {
+    secondFactor?: boolean;
     id: string;
     accountId: string;
     publicKey: string;
@@ -184,6 +198,33 @@ export interface SignupStart extends SignupState {
     };
 }
 export interface AuthService extends FactorRecoveryService {
+    createSecondFactorProof(input: {
+        browserHash: string;
+        proof: PasskeyAuthProof;
+    }): Promise<string>;
+    setPasskeySecondFactor(input: {
+        token: string;
+        credentialId: string;
+        enabled: boolean;
+        secondFactor?: AuthSecondFactor;
+    }): Promise<void>;
+    rememberDevice(input: {
+        token: string;
+        label?: string;
+    }): Promise<{
+        token: string;
+        expires: number;
+    }>;
+    listTrustedDevices(token: string): Promise<{
+        id: string;
+        label: string;
+        created: number;
+        expires: number;
+    }[]>;
+    revokeTrustedDevice(input: {
+        token: string;
+        deviceId: string;
+    }): Promise<void>;
     beginSignup(input: {
         email: string;
         browserHash: string;
@@ -228,6 +269,7 @@ export interface AuthService extends FactorRecoveryService {
         password: string;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<AuthSessionResult>;
     authenticate(token: string): Promise<AuthPrincipal | null>;
     logout(token: string): Promise<void>;
@@ -286,7 +328,8 @@ export interface AuthService extends FactorRecoveryService {
     disableTotp(input: {
         token: string;
         password: string;
-        code: string;
+        code?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<void>;
     adminSetRoles(input: {
         actorToken: string;
@@ -330,11 +373,13 @@ export interface AuthService extends FactorRecoveryService {
         proof: ExternalAuthProof;
     } | null>;
     issueSession(accountId: string, input: {
+        trustedDevice?: string;
         method: 'passkey' | 'oidc';
         proof: AuthProof;
         device?: AuthDevice;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<AuthSessionResult>;
     addPasskey(input: {
         actorToken: string;
@@ -357,6 +402,7 @@ export interface AuthService extends FactorRecoveryService {
         password: string;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<void>;
     exportAccount(token: string): Promise<{
         user: AuthUser;
@@ -375,6 +421,7 @@ export interface AuthService extends FactorRecoveryService {
         password?: string;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<{
         cancelToken: string;
         deleteAfter: number;
@@ -392,11 +439,13 @@ export interface AuthService extends FactorRecoveryService {
         code: string | null;
     }>;
     consumeEmailCode(input: {
+        trustedDevice?: string;
         flowId: string;
         code: string;
         device?: AuthDevice;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<AuthSessionResult>;
     createCase(input: {
         actorToken: string;
@@ -503,6 +552,7 @@ export interface AuthService extends FactorRecoveryService {
         proof: PasskeyAuthProof;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<AuthSessionResult>;
     removePasskey(input: {
         token: string;
@@ -534,6 +584,7 @@ export interface AuthService extends FactorRecoveryService {
         password?: string;
         totp?: string;
         recoveryCode?: string;
+        secondFactor?: AuthSecondFactor;
     }): Promise<{
         oldEmail: string;
         newEmail: string;
@@ -663,14 +714,20 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         fail(400, 'invalid_configuration_approval');
     if (options.configurationTag !== undefined && (typeof options.configurationTag !== 'string' || options.configurationTag.length < 1 || options.configurationTag.length > 128 || /[\x00-\x1f\x7f]/.test(options.configurationTag)))
         fail(400, 'invalid_configuration_tag');
-    for (const value of [options.requireEmailVerification, options.requireMfa])
+    for (const value of [options.requireEmailVerification, options.requireMfa, options.blockDisposableEmails])
         if (value !== undefined && typeof value !== 'boolean')
             fail(400, 'invalid_security_policy');
     const deletionGraceMs = options.deletionGraceMs ?? 604800000;
     if (!Number.isSafeInteger(deletionGraceMs) || deletionGraceMs < 86400000 || deletionGraceMs > 2592000000)
         fail(400, 'invalid_deletion_grace');
-    if(options.allowEmailFactorRecovery!==undefined&&typeof options.allowEmailFactorRecovery!=='boolean')fail(400,'invalid_factor_recovery_policy');
-    const securityPolicy: AuthSecurityPolicy = Object.freeze({ ...(options.allowEmailFactorRecovery===true?{allowEmailFactorRecovery:true as const}:{}), requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
+    if (options.allowEmailFactorRecovery !== undefined && typeof options.allowEmailFactorRecovery !== 'boolean')
+        fail(400, 'invalid_factor_recovery_policy');
+    if (options.allowPasskeySecondFactor !== undefined && typeof options.allowPasskeySecondFactor !== 'boolean')
+        fail(400, 'invalid_security_policy');
+    const trustedDeviceTtlMs = options.trustedDeviceTtlMs ?? 0;
+    if (!Number.isSafeInteger(trustedDeviceTtlMs) || trustedDeviceTtlMs < 0 || trustedDeviceTtlMs > 2592000000 || trustedDeviceTtlMs > 0 && trustedDeviceTtlMs < 60000)
+        fail(400, 'invalid_trusted_device_policy');
+    const securityPolicy: AuthSecurityPolicy = Object.freeze({ ...(options.allowPasskeySecondFactor ? { allowPasskeySecondFactor: true as const } : {}), ...(trustedDeviceTtlMs ? { trustedDeviceTtlMs } : {}), ...(options.allowEmailFactorRecovery === true ? { allowEmailFactorRecovery: true as const } : {}), requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
     const supplied = options.encryptionKeys ?? (options.encryptionKey ? { legacy: options.encryptionKey } : {}), activeKey = options.activeEncryptionKey ?? 'legacy';
     const keys: Record<string, Buffer> = Object.create(null);
     if (Object.keys(supplied).length < 1 || Object.keys(supplied).length > 8)
@@ -710,7 +767,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     const allowed = domains(options.allowedEmailDomains), blocked = domains(options.blockedEmailDomains);
     const permittedEmail = (value: string) => {
         const email = normalizeEmail(value), domain = email.split('@')[1]!;
-        if (blockedEmails.includes(email) || (allowedEmails.length && !allowedEmails.includes(email)) || blocked.includes(domain) || (allowed.length && !allowed.includes(domain)))
+        if (options.blockDisposableEmails && isDisposableEmailDomain(domain) || blockedEmails.includes(email) || (allowedEmails.length && !allowedEmails.includes(email)) || blocked.includes(domain) || (allowed.length && !allowed.includes(domain)))
             fail(403, 'registration_unavailable');
         return email;
     };
@@ -726,7 +783,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(503, 'invalid_clock');
         return value;
     };
-    const store = await openAuthStore({ database: options.database, ...(options.approveConfigurationChangeFrom ? { approveConfigurationChangeFrom: options.approveConfigurationChangeFrom } : {}), configurationChangeAt: now(), ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), roles, defaultRole, sessionTtlMs: ttl, sessionIdleMs: idle, securityPolicy, registration: { mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
+    const store = await openAuthStore({ database: options.database, ...(options.approveConfigurationChangeFrom ? { approveConfigurationChangeFrom: options.approveConfigurationChangeFrom } : {}), configurationChangeAt: now(), ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), roles, defaultRole, sessionTtlMs: ttl, sessionIdleMs: idle, securityPolicy, registration: { ...(options.blockDisposableEmails ? { disposableDomainsRevision } : {}), mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
     let closed = false;
     const hookStats: AuthHookStats = { accepted: 0, dropped: 0, failed: 0, timedOut: 0 };
     const hookControllers = new Set<AbortController>();
@@ -762,7 +819,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             return fail(400, 'invalid_registration_profile');
         }
     };
-    const publicUser = (user: AuthRecord): AuthUser => ({ ...basePublicUser(user), ...(user.profile ? { profile: profilePolicy.publicProfile(user.profile) } : {}) });
+    const publicUser = (user: AuthRecord): AuthUser => ({ ...basePublicUser(user), ...(securityPolicy.allowPasskeySecondFactor && user.mfaPasskeys?.length ? { passkeyMfaEnabled: true } : {}), ...(user.profile ? { profile: profilePolicy.publicProfile(user.profile) } : {}) });
     const newPassword = async (value: string) => {
         password(value);
         if (options.checkPassword) {
@@ -789,13 +846,16 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         return hashPassword(value);
     };
     const perms = (names: string[]) => [...new Set(names.flatMap(name => roles[name] || []))];
-    const restrictions = (user: AuthRecord): AuthRestriction[] => [...(securityPolicy.requireEmailVerification && !user.emailVerified ? ['verify-email' as const] : []), ...((user.mfaRecoveryRequired || securityPolicy.requireMfa && !user.totpSecret) ? ['enroll-mfa' as const] : [])];
+    const restrictions = (user: AuthRecord): AuthRestriction[] => [...(securityPolicy.requireEmailVerification && !user.emailVerified ? ['verify-email' as const] : []), ...((user.mfaRecoveryRequired || securityPolicy.requireMfa && !user.totpSecret && !(securityPolicy.allowPasskeySecondFactor && user.mfaPasskeys?.length)) ? ['enroll-mfa' as const] : [])];
     const principal = (user: AuthRecord, session: SessionRecord): AuthPrincipal => { const pending = restrictions(user); return { id: user.id, email: user.email, emailVerified: user.emailVerified, roles: pending.length ? [] : [...user.roles], permissions: pending.length ? [] : session.impersonatorId ? perms(user.roles).filter(p => p !== '*' && !p.startsWith('auth.') && !p.startsWith('admin.')) : perms(user.roles), ...(pending.length ? { restrictions: pending } : {}), ...(session.impersonatorId ? { impersonatorId: session.impersonatorId } : {}), sessionId: session.id, authenticatedAt: session.authenticatedAt }; };
-    const sessionFor = (accountId: string, device?: AuthDevice) => {
+    const sessionFor = (accountId: string, device?: AuthDevice): {
+        raw: string;
+        value: SessionRecord;
+    } => {
         if (device && (!validToken(device.id) || device.label !== undefined && (typeof device.label !== 'string' || device.label.length > 160 || /[\x00-\x1f\x7f]/.test(device.label))))
             fail(400, 'invalid_device');
         const raw = token(), created = now();
-        return { raw, value: { id: randomUUID(), hash: digest(raw), accountId, created, authenticatedAt: created, expires: created + ttl, ...(device ? { deviceHash: digest(device.id), deviceLabel: device.label ?? 'Browser' } : {}) } };
+        return { raw, value: { id: randomUUID(), hash: digest(raw), accountId, created, authenticatedAt: created, primaryMethod: 'password', expires: created + ttl, ...(device ? { deviceHash: digest(device.id), deviceLabel: device.label ?? 'Browser' } : {}) } };
     };
     const seal = (value: string, context: string) => { const nonce = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, nonce); cipher.setAAD(Buffer.from(context)); const bytes = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]); return activeKey + '.' + Buffer.concat([nonce, cipher.getAuthTag(), bytes]).toString('base64url'); };
     const unseal = (value: string, context: string) => {
@@ -829,7 +889,8 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(403, 'impersonation_restricted');
         if (fresh && now() - value.session.authenticatedAt > 300000)
             fail(401, 'fresh_authentication_required');
-        if(enrollment&&value.user.mfaRecoveryRequired&&!value.session.recoveryEnrollment)fail(403,'recovery_enrollment_proof_required');
+        if (enrollment && value.user.mfaRecoveryRequired && !value.session.recoveryEnrollment)
+            fail(403, 'recovery_enrollment_proof_required');
         if (fresh) {
             const pending = restrictions(value.user);
             if (pending.length && (!enrollment || pending.includes('verify-email')))
@@ -850,9 +911,24 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     const factor = (user: AuthRecord, input: {
         totp?: string;
         recoveryCode?: string;
-    }): Record<string, unknown> => {
-        if (!user.totpSecret)
+        secondFactor?: AuthSecondFactor;
+        trustedDevice?: string;
+    }, allowTrusted = false): Record<string, unknown> => {
+        if (input.secondFactor) {
+            if (!securityPolicy.allowPasskeySecondFactor || !validToken(input.secondFactor.token) || !/^[a-f0-9]{64}$/.test(input.secondFactor.browserHash))
+                fail(401, 'invalid_second_factor');
+            return { secondFactorHash: digest(input.secondFactor.token), secondFactorBrowser: input.secondFactor.browserHash };
+        }
+        if (allowTrusted && input.trustedDevice && !input.totp && !input.recoveryCode && (user.totpSecret || securityPolicy.allowPasskeySecondFactor && user.mfaPasskeys?.length)) {
+            if (!trustedDeviceTtlMs || !validToken(input.trustedDevice))
+                fail(401, 'invalid_trusted_device');
+            return { trustedDeviceHash: digest(input.trustedDevice) };
+        }
+        if (!user.totpSecret) {
+            if (securityPolicy.allowPasskeySecondFactor && user.mfaPasskeys?.length)
+                fail(401, 'second_factor_required');
             return {};
+        }
         if (input.recoveryCode) {
             if (!/^[A-Za-z0-9_-]{22}$/.test(input.recoveryCode))
                 fail(401, 'invalid_credentials');
@@ -889,7 +965,9 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         const verified = await verifyPassword(input.password, user?.passwordHash);
         if (!verified || !user || user.status !== 'active')
             return fail(401, 'invalid_credentials');
-        const fact = factor(user, input), session = sessionFor(user.id, input.device), upgradedHash = !user.passwordHash.startsWith('scrypt-v1$') ? await hashPassword(input.password, false) : undefined;
+        const fact = factor(user, input, !oldToken), session = sessionFor(user.id, input.device), upgradedHash = !user.passwordHash.startsWith('scrypt-v1$') ? await hashPassword(input.password, false) : undefined;
+        if (fact.trustedDeviceHash)
+            session.value.authenticatedAt = 0;
         const stored = await store.call<AuthRecord>('login', { accountId: user.id, version: user.version, passwordHash: user.passwordHash, ...(upgradedHash ? { upgradedHash } : {}), ...fact, session: session.value, attemptKey, ...(oldToken ? { oldHash: digest(oldToken) } : {}), now: now() });
         return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value), ...(stored.newDevice ? { newDevice: true } : {}) };
     };
@@ -949,12 +1027,50 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         return row!;
     };
     const service: AuthService = {
-        getFactorRecoveryEnabled:()=>securityPolicy.allowEmailFactorRecovery===true,
-        async beginFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.browserToken))fail(400,'invalid_recovery_browser');const email=normalizeEmail(input.email);await attempt('factor-recovery:'+email);const verificationToken=token(),cancelToken=token();const issued=await store.call<boolean>('factorRecoveryBegin',{email,browser:digest(input.browserToken),verification:digest(verificationToken),cancellation:digest(cancelToken),now:now()});return {verificationToken:issued?verificationToken:null,cancelToken:issued?cancelToken:null};},
-        async confirmFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.token)||!validToken(input.browserToken))fail(400,'invalid_recovery_token');return store.call<{completeAfter:number;expires:number}>('factorRecoveryConfirm',{verification:digest(input.token),browser:digest(input.browserToken),now:now()});},
-        async cancelFactorRecovery(raw){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(raw))fail(400,'invalid_recovery_token');await store.call('factorRecoveryCancel',{cancellation:digest(raw),now:now()});},
-        async completeFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.token)||!validToken(input.browserToken))fail(400,'invalid_recovery_token');const raw=token(),timestamp=now();const value={id:randomUUID(),hash:digest(raw),accountId:'',created:timestamp,authenticatedAt:timestamp,expires:timestamp+Math.min(ttl,1800000)};const user=await store.call<AuthRecord>('factorRecoveryComplete',{verification:digest(input.token),browser:digest(input.browserToken),session:value,now:timestamp});value.accountId=user.id;return {user:publicUser(user),token:raw,principal:principal(user,value)};},
-
+        async createSecondFactorProof(input) {
+            check();
+            if (!securityPolicy.allowPasskeySecondFactor || typeof input.browserHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.browserHash))
+                fail(400, 'invalid_second_factor');
+            const proof = validateProof(input.proof, 'passkey'), raw = token();
+            await store.call('factorProof', { hash: digest(raw), browser: input.browserHash, proof, now: now() });
+            return raw;
+        },
+        async setPasskeySecondFactor(input) {
+            if (!securityPolicy.allowPasskeySecondFactor || !validToken(input.token) || typeof input.enabled !== 'boolean' || typeof input.credentialId !== 'string' || !input.credentialId || input.credentialId.length > 2048)
+                fail(400, 'invalid_second_factor');
+            const { user } = await lookupSession(input.token, true, input.enabled);
+            const fact = input.enabled ? factor(user, input.secondFactor ? { secondFactor: input.secondFactor } : {}) : {};
+            if (input.enabled && !fact.secondFactorHash)
+                fail(401, 'second_factor_required');
+            await store.call('setPasskeyFactor', { hash: digest(input.token), credentialId: input.credentialId, enabled: input.enabled, ...fact, now: now() });
+        },
+        async rememberDevice(input) {
+            if (!trustedDeviceTtlMs || !validToken(input.token) || input.label !== undefined && (typeof input.label !== 'string' || input.label.length > 160 || /[\x00-\x1f\x7f]/.test(input.label)))
+                fail(400, 'invalid_trusted_device');
+            const raw = token(), expires = now() + trustedDeviceTtlMs;
+            await store.call('rememberDevice', { hash: digest(input.token), deviceHash: digest(raw), deviceId: randomUUID(), label: input.label ?? 'Browser', expires, now: now() });
+            return { token: raw, expires };
+        },
+        async listTrustedDevices(raw) { if (!validToken(raw))
+            fail(401, 'invalid_credentials'); return store.call('trustedDevices', { hash: digest(raw), now: now() }); },
+        async revokeTrustedDevice(input) { if (!validToken(input.token))
+            fail(401, 'invalid_credentials'); await store.call('revokeTrustedDevice', { hash: digest(input.token), deviceId: id(input.deviceId), now: now() }); },
+        getFactorRecoveryEnabled: () => securityPolicy.allowEmailFactorRecovery === true,
+        async beginFactorRecovery(input) { check(); if (!securityPolicy.allowEmailFactorRecovery)
+            fail(403, 'factor_recovery_disabled'); if (!validToken(input.browserToken))
+            fail(400, 'invalid_recovery_browser'); const email = normalizeEmail(input.email); await attempt('factor-recovery:' + email); const verificationToken = token(), cancelToken = token(); const issued = await store.call<boolean>('factorRecoveryBegin', { email, browser: digest(input.browserToken), verification: digest(verificationToken), cancellation: digest(cancelToken), now: now() }); return { verificationToken: issued ? verificationToken : null, cancelToken: issued ? cancelToken : null }; },
+        async confirmFactorRecovery(input) { check(); if (!securityPolicy.allowEmailFactorRecovery)
+            fail(403, 'factor_recovery_disabled'); if (!validToken(input.token) || !validToken(input.browserToken))
+            fail(400, 'invalid_recovery_token'); return store.call<{
+            completeAfter: number;
+            expires: number;
+        }>('factorRecoveryConfirm', { verification: digest(input.token), browser: digest(input.browserToken), now: now() }); },
+        async cancelFactorRecovery(raw) { check(); if (!securityPolicy.allowEmailFactorRecovery)
+            fail(403, 'factor_recovery_disabled'); if (!validToken(raw))
+            fail(400, 'invalid_recovery_token'); await store.call('factorRecoveryCancel', { cancellation: digest(raw), now: now() }); },
+        async completeFactorRecovery(input) { check(); if (!securityPolicy.allowEmailFactorRecovery)
+            fail(403, 'factor_recovery_disabled'); if (!validToken(input.token) || !validToken(input.browserToken))
+            fail(400, 'invalid_recovery_token'); const raw = token(), timestamp = now(); const value = { id: randomUUID(), hash: digest(raw), accountId: '', created: timestamp, authenticatedAt: timestamp, expires: timestamp + Math.min(ttl, 1800000) }; const user = await store.call<AuthRecord>('factorRecoveryComplete', { verification: digest(input.token), browser: digest(input.browserToken), session: value, now: timestamp }); value.accountId = user.id; return { user: publicUser(user), token: raw, principal: principal(user, value) }; },
         async beginSignup(input) {
             check();
             if (typeof input.browserHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.browserHash))
@@ -1041,7 +1157,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             const value = await lookupSession(input.token);
             if (value.session.impersonatorId)
                 fail(403, 'impersonation_restricted');
-            return login({ email: value.user.email, password: input.password, ...(input.totp ? { totp: input.totp } : {}), ...(input.recoveryCode ? { recoveryCode: input.recoveryCode } : {}) }, input.token);
+            return login({ email: value.user.email, password: input.password, ...(input.totp ? { totp: input.totp } : {}), ...(input.recoveryCode ? { recoveryCode: input.recoveryCode } : {}), ...(input.secondFactor ? { secondFactor: input.secondFactor } : {}) }, input.token);
         },
         async authenticate(raw) {
             check();
@@ -1130,8 +1246,8 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             await attempt('totp:' + user.id);
             if (user.passwordHash && !await verifyPassword(input.password, user.passwordHash) || !user.totpSecret)
                 fail(401, 'invalid_credentials');
-            const step = counter(user.totpSecret!, input.code, user.id);
-            await store.call('totpDisable', { hash: digest(input.token), version: user.version, counter: step, now: now() });
+            const fact = input.secondFactor ? factor(user, input) : { counter: counter(user.totpSecret!, input.code ?? '', user.id) };
+            await store.call('totpDisable', { hash: digest(input.token), version: user.version, ...fact, now: now() });
         },
         async adminSetRoles(input) {
             check();
@@ -1190,7 +1306,12 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             const user = await store.call<AuthRecord | null>('account', { id: id(accountId) });
             if (!user || user.status !== 'active')
                 fail(401, 'invalid_credentials');
-            const attemptKey = await attempt('login:' + user!.email), fact = factor(user!, input), session = sessionFor(accountId, input.device);
+            const attemptKey = await attempt('login:' + user!.email), fact = factor(user!, input, true), session = sessionFor(accountId, input.device);
+            session.value.primaryMethod = input.method;
+            if (proof.kind === 'passkey')
+                session.value.primaryCredentialId = proof.credentialId;
+            if (fact.trustedDeviceHash)
+                session.value.authenticatedAt = 0;
             const stored = await store.call<AuthRecord>('login', { accountId, proof, version: user!.version, passwordHash: user!.passwordHash, ...fact, session: session.value, attemptKey, now: now() });
             return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value), ...(stored.newDevice ? { newDevice: true } : {}) };
         },
@@ -1198,7 +1319,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             check();
             if (!validToken(input.actorToken) || !input.credential || typeof input.credential.id !== 'string' || input.credential.id.length > 2048 || !input.credential.id || typeof input.credential.publicKey !== 'string' || input.credential.publicKey.length > 8192 || !Number.isSafeInteger(input.credential.counter) || input.credential.counter < 0 || (input.credential.transports && (input.credential.transports.length > 8 || input.credential.transports.some(t => !['ble', 'cable', 'hybrid', 'internal', 'nfc', 'smart-card', 'usb'].includes(t)))))
                 fail(400, 'invalid_passkey');
-            await store.call('addPasskey', { hash: digest(input.actorToken), credential: input.credential, now: now() });
+            await store.call('addPasskey', { hash: digest(input.actorToken), credential: { id: input.credential.id, publicKey: input.credential.publicKey, counter: input.credential.counter, ...(input.credential.transports ? { transports: input.credential.transports } : {}) }, now: now() });
         },
         async getPasskey(credentialId) {
             check();
@@ -1270,8 +1391,11 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             const user = await store.call<AuthRecord | null>('checkEmailCode', { hash: digest(input.flowId), codeHash: digest(input.flowId + ':' + input.code), now: now() });
             if (!user)
                 fail(400, 'invalid_code');
-            const session = sessionFor(user!.id, input.device);
-            const stored = await store.call<AuthRecord>('codeLogin', { hash: digest(input.flowId), codeHash: digest(input.flowId + ':' + input.code), version: user!.version, ...factor(user!, input), session: session.value, now: now() });
+            const session = sessionFor(user!.id, input.device), fact = factor(user!, input, true);
+            session.value.primaryMethod = 'email-code';
+            if (fact.trustedDeviceHash)
+                session.value.authenticatedAt = 0;
+            const stored = await store.call<AuthRecord>('codeLogin', { hash: digest(input.flowId), codeHash: digest(input.flowId + ':' + input.code), version: user!.version, ...fact, session: session.value, now: now() });
             return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value), ...(stored.newDevice ? { newDevice: true } : {}) };
         },
         async createCase(input) {
@@ -1398,6 +1522,9 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             if (previous.impersonatorId)
                 fail(403, 'impersonation_restricted');
             const attemptKey = await attempt('login:' + user.email), fact = factor(user, input), session = sessionFor(user.id);
+            session.value.primaryMethod = 'passkey';
+            if (proof.kind === 'passkey')
+                session.value.primaryCredentialId = proof.credentialId;
             const stored = await store.call<AuthRecord>('login', { accountId: user.id, proof, version: user.version, passwordHash: user.passwordHash, ...fact, session: session.value, oldHash: digest(input.token), attemptKey, now: now() });
             return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value) };
         },

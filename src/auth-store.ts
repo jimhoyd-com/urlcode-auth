@@ -10,7 +10,8 @@ export class AuthError extends Error {
     constructor(status: number, code: string) { super(code); this.status = status; this.code = code; }
 }
 export interface AuthRecord {
-    mfaRecoveryRequired?:boolean;
+    mfaPasskeys?: string[];
+    mfaRecoveryRequired?: boolean;
     id: string;
     email: string;
     emailVerified: boolean;
@@ -28,7 +29,11 @@ export interface AuthRecord {
     newDevice?: boolean;
 }
 export interface SessionRecord {
-    recoveryEnrollment?:number;
+    primaryMethod?: string;
+    primaryCredentialId?: string;
+    mfaAuthenticatedAt?: number;
+    mfaVersion?: number;
+    recoveryEnrollment?: number;
     id: string;
     hash: string;
     accountId: string;
@@ -51,12 +56,15 @@ export interface StoreOptions {
     sessionIdleMs: number;
     sessionTtlMs: number;
     securityPolicy: {
-        allowEmailFactorRecovery?:true;
+        allowPasskeySecondFactor?: true;
+        trustedDeviceTtlMs?: number;
+        allowEmailFactorRecovery?: true;
         requireEmailVerification: boolean;
         requireMfa: boolean;
         deletionGraceMs: number;
     };
     registration: {
+        disposableDomainsRevision?: string;
         mode: string;
         allowed: string[];
         blocked: string[];
@@ -210,7 +218,7 @@ if (!isMainThread && workerData?.authStore) {
         user: AuthRecord;
         session: SessionRecord;
     } | null => {
-        const found = db.prepare('SELECT id,hash,account_id AS accountId,created,authenticated_at AS authenticatedAt,expires,last_seen AS lastSeen,device_label AS deviceLabel,impersonator_id AS impersonatorId,actor_version AS actorVersion,recovery_enrollment AS recoveryEnrollment FROM auth_sessions WHERE hash=? AND expires>?').get(hash, now);
+        const found = db.prepare('SELECT id,hash,account_id AS accountId,created,authenticated_at AS authenticatedAt,expires,last_seen AS lastSeen,device_label AS deviceLabel,impersonator_id AS impersonatorId,actor_version AS actorVersion,recovery_enrollment AS recoveryEnrollment,primary_method AS primaryMethod,primary_credential AS primaryCredentialId,mfa_authenticated_at AS mfaAuthenticatedAt,mfa_version AS mfaVersion FROM auth_sessions WHERE hash=? AND expires>?').get(hash, now);
         if (!found || now - Number(found.lastSeen) >= options.sessionIdleMs)
             return null;
         const user = account(String(found.accountId));
@@ -221,14 +229,16 @@ if (!isMainThread && workerData?.authStore) {
         }
         return user?.status === 'active' ? { user, session: found as unknown as SessionRecord } : null;
     };
-    const restricted = (user: AuthRecord) => user.mfaRecoveryRequired || options.securityPolicy.requireEmailVerification && !user.emailVerified || options.securityPolicy.requireMfa && !user.totpSecret;
+    const passkeyFactor = (user: AuthRecord) => Boolean(options.securityPolicy.allowPasskeySecondFactor && user.mfaPasskeys?.length);
+    const restricted = (user: AuthRecord) => user.mfaRecoveryRequired || options.securityPolicy.requireEmailVerification && !user.emailVerified || options.securityPolicy.requireMfa && !user.totpSecret && !passkeyFactor(user);
     const fresh = (hash: string, now: number, enrollment = false) => {
         const found = session(hash, now);
         if (found?.session.impersonatorId)
             error(403, 'impersonation_restricted');
         if (!found || now - found.session.authenticatedAt > 300000)
             error(401, 'fresh_authentication_required');
-        if(enrollment&&found!.user.mfaRecoveryRequired&&!found!.session.recoveryEnrollment)error(403,'recovery_enrollment_proof_required');
+        if (enrollment && found!.user.mfaRecoveryRequired && !found!.session.recoveryEnrollment)
+            error(403, 'recovery_enrollment_proof_required');
         if (restricted(found!.user) && (!enrollment || options.securityPolicy.requireEmailVerification && !found!.user.emailVerified))
             error(403, 'enrollment_required');
         return found!;
@@ -245,9 +255,54 @@ if (!isMainThread && workerData?.authStore) {
             if (!p.includes('*') && !p.includes(permission))
                 error(403, 'delegation_ceiling_exceeded');
     };
-    const consumeFactor = (user: AuthRecord, args: Record<string, unknown>) => {
-        if (!user.totpSecret)
-            return;
+    const passkeyProof = (user: AuthRecord, value: unknown, update: boolean) => {
+        const proof = value as {
+            kind?: string;
+            version?: number;
+            credentialId?: string;
+            publicKeyHash?: string;
+            expectedCounter?: number;
+            newCounter?: number;
+        };
+        const credential = proof && db.prepare('SELECT data,counter FROM auth_passkeys WHERE id=? AND account_id=?').get(String(proof.credentialId), user.id);
+        if (!credential || proof.kind !== 'passkey' || proof.version !== user.version || num(credential.counter) !== proof.expectedCounter || createHash('sha256').update(String(JSON.parse(String(credential.data)).publicKey)).digest('hex') !== proof.publicKeyHash || !Number.isSafeInteger(proof.newCounter) || proof.newCounter! < 0 || !(proof.expectedCounter === 0 && proof.newCounter === 0) && proof.newCounter! <= proof.expectedCounter!)
+            error(401, 'stale_auth_proof');
+        if (update)
+            db.prepare('UPDATE auth_passkeys SET counter=? WHERE id=? AND account_id=? AND counter=?').run(proof.newCounter!, String(proof.credentialId), user.id, proof.expectedCounter!);
+        return proof.credentialId!;
+    };
+    const takeSecondFactor = (user: AuthRecord, args: Record<string, unknown>, now: number, enrollmentId?: string) => {
+        if (!options.securityPolicy.allowPasskeySecondFactor)
+            error(401, 'invalid_second_factor');
+        const row = db.prepare('SELECT * FROM auth_second_factor_proofs WHERE hash=? AND browser=? AND account_id=? AND expires>?').get(String(args.secondFactorHash), String(args.secondFactorBrowser), user.id, now);
+        if (!row || row.version !== user.version)
+            error(401, 'invalid_second_factor');
+        const proof = JSON.parse(String(row!.proof)), primaryCredential = (args.session as SessionRecord | undefined)?.primaryCredentialId;
+        if (enrollmentId ? proof.credentialId !== enrollmentId : !user.mfaPasskeys?.includes(proof.credentialId))
+            error(401, 'invalid_second_factor');
+        if (primaryCredential === proof.credentialId)
+            error(401, 'independent_second_factor_required');
+        passkeyProof(user, proof, true);
+        db.prepare('DELETE FROM auth_second_factor_proofs WHERE hash=?').run(String(args.secondFactorHash));
+    };
+    const consumeFactor = (user: AuthRecord, args: Record<string, unknown>, now: number): boolean => {
+        if (args.secondFactorHash) {
+            takeSecondFactor(user, args, now);
+            return true;
+        }
+        if (args.trustedDeviceHash) {
+            if (!options.securityPolicy.trustedDeviceTtlMs || user.mfaRecoveryRequired || !user.totpSecret && !passkeyFactor(user) || !db.prepare('SELECT id FROM auth_trusted_devices WHERE hash=? AND account_id=? AND version=? AND expires>?').get(String(args.trustedDeviceHash), user.id, user.version, now))
+                error(401, 'invalid_trusted_device');
+            if (!args.session || args.oldHash)
+                error(401, 'invalid_trusted_device');
+            (args.session as unknown as SessionRecord).authenticatedAt = 0;
+            return false;
+        }
+        if (!user.totpSecret) {
+            if (passkeyFactor(user))
+                error(401, 'second_factor_required');
+            return false;
+        }
         if (args.recoveryHash) {
             if (db.prepare('DELETE FROM auth_recovery WHERE hash=? AND account_id=?').run(String(args.recoveryHash), user.id).changes !== 1)
                 error(401, 'invalid_credentials');
@@ -259,6 +314,13 @@ if (!isMainThread && workerData?.authStore) {
             user.totpCounter = counter;
             save(user);
         }
+        return true;
+    };
+    const realMfa = (hash: string, now: number) => {
+        const found = fresh(hash, now);
+        if (!found.session.mfaAuthenticatedAt || now - found.session.mfaAuthenticatedAt > 300000 || found.session.mfaVersion !== found.user.version)
+            error(403, 'fresh_second_factor_required');
+        return found;
     };
     const addSession = (value: SessionRecord) => {
         let newDevice = false;
@@ -269,7 +331,7 @@ if (!isMainThread && workerData?.authStore) {
         }
         db.prepare('DELETE FROM auth_sessions WHERE hash IN (SELECT hash FROM auth_sessions WHERE expires<=? LIMIT 1000)').run(value.created);
         db.prepare('DELETE FROM auth_sessions WHERE account_id=? AND id NOT IN (SELECT id FROM auth_sessions WHERE account_id=? ORDER BY created DESC,id DESC LIMIT 19)').run(value.accountId, value.accountId);
-        db.prepare('INSERT INTO auth_sessions(hash,id,account_id,created,authenticated_at,expires,impersonator_id,actor_version,last_seen,device_label,recovery_enrollment) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(value.hash, value.id, value.accountId, value.created, value.authenticatedAt, value.expires, value.impersonatorId ?? null, value.actorVersion ?? null, value.created, value.deviceLabel ?? null,value.recoveryEnrollment??0);
+        db.prepare('INSERT INTO auth_sessions(hash,id,account_id,created,authenticated_at,expires,impersonator_id,actor_version,last_seen,device_label,recovery_enrollment,primary_method,primary_credential,mfa_authenticated_at,mfa_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(value.hash, value.id, value.accountId, value.created, value.authenticatedAt, value.expires, value.impersonatorId ?? null, value.actorVersion ?? null, value.created, value.deviceLabel ?? null, value.recoveryEnrollment ?? 0, value.primaryMethod ?? 'unknown', value.primaryCredentialId ?? null, value.mfaAuthenticatedAt ?? 0, value.mfaVersion ?? 0);
         return newDevice;
     };
     try {
@@ -308,9 +370,13 @@ if (!isMainThread && workerData?.authStore) {
         if (!db.prepare('PRAGMA table_info(auth_waitlist)').all().some(row => row.name === 'email_verified'))
             db.exec('ALTER TABLE auth_waitlist ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_waitlist ADD COLUMN passkey TEXT;');
         db.exec('CREATE TABLE IF NOT EXISTS auth_factor_recovery(account_id TEXT PRIMARY KEY REFERENCES auth_accounts(id) ON DELETE CASCADE,verification_hash TEXT NOT NULL UNIQUE,cancel_hash TEXT NOT NULL UNIQUE,browser_hash TEXT NOT NULL,version INTEGER NOT NULL,complete_after INTEGER,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_factor_recovery_expiry ON auth_factor_recovery(expires);');
+        if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'primary_method'))
+            db.exec("ALTER TABLE auth_sessions ADD COLUMN primary_method TEXT NOT NULL DEFAULT 'unknown';ALTER TABLE auth_sessions ADD COLUMN primary_credential TEXT;ALTER TABLE auth_sessions ADD COLUMN mfa_authenticated_at INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_sessions ADD COLUMN mfa_version INTEGER NOT NULL DEFAULT 0;");
+        db.exec('CREATE TABLE IF NOT EXISTS auth_second_factor_proofs(hash TEXT PRIMARY KEY,browser TEXT NOT NULL,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,version INTEGER NOT NULL,proof TEXT NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_second_factor_expiry ON auth_second_factor_proofs(expires);CREATE TABLE IF NOT EXISTS auth_trusted_devices(hash TEXT PRIMARY KEY,id TEXT NOT NULL UNIQUE,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,version INTEGER NOT NULL,label TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS auth_trusted_expiry ON auth_trusted_devices(expires);');
         db.exec('CREATE TABLE IF NOT EXISTS auth_signups(hash TEXT PRIMARY KEY,browser TEXT NOT NULL,email TEXT NOT NULL,account_id TEXT NOT NULL,step TEXT NOT NULL,expires INTEGER NOT NULL,code_hash TEXT NOT NULL,code_expires INTEGER NOT NULL,attempts INTEGER NOT NULL,eligible INTEGER NOT NULL,invitation_hash TEXT NOT NULL,credential TEXT,challenge TEXT);CREATE INDEX IF NOT EXISTS auth_signups_expiry ON auth_signups(expires);');
-        if(!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row=>row.name==='recovery_enrollment'))db.exec('ALTER TABLE auth_sessions ADD COLUMN recovery_enrollment INTEGER NOT NULL DEFAULT 0');
-        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), ...(options.sessionTtlMs !== 86400000 || options.sessionIdleMs !== 1800000 ? { sessionLimits: { absoluteMs: options.sessionTtlMs, idleMs: options.sessionIdleMs } } : {}), ...(options.securityPolicy.allowEmailFactorRecovery || options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
+        if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'recovery_enrollment'))
+            db.exec('ALTER TABLE auth_sessions ADD COLUMN recovery_enrollment INTEGER NOT NULL DEFAULT 0');
+        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), ...(options.sessionTtlMs !== 86400000 || options.sessionIdleMs !== 1800000 ? { sessionLimits: { absoluteMs: options.sessionTtlMs, idleMs: options.sessionIdleMs } } : {}), ...(options.securityPolicy.allowPasskeySecondFactor || options.securityPolicy.trustedDeviceTtlMs || options.securityPolicy.allowEmailFactorRecovery || options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
         configurationRevision = transaction(() => {
             const previous = db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value;
             const currentDefinition = db.prepare("SELECT value FROM auth_meta WHERE key='configurationDefinition'").get()?.value ?? previous;
@@ -339,7 +405,7 @@ if (!isMainThread && workerData?.authStore) {
                 if (priorAdministrators > 0 && nextAdministrators === 0)
                     error(503, 'configuration_admin_required');
                 const counts: Record<string, number> = {};
-                for (const table of ['auth_sessions', 'auth_tokens', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery'])
+                for (const table of ['auth_sessions', 'auth_tokens', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices'])
                     counts[table] = num(db.prepare('SELECT count(*) AS n FROM ' + table).get()?.n);
                 const adminRoles = Object.keys(roles).filter(role => roles[role]!.includes('*'));
                 const adminSql = adminRoles.length ? "EXISTS(SELECT 1 FROM json_each(auth_accounts.data,'$.roles') WHERE value IN (" + adminRoles.map(() => '?').join(',') + '))' : '0';
@@ -348,7 +414,7 @@ if (!isMainThread && workerData?.authStore) {
                 db.prepare("UPDATE auth_tokens SET version=(SELECT json_extract(data,'$.version') FROM auth_accounts WHERE id=auth_tokens.account_id) WHERE purpose='cancel-deletion'").run();
                 const cancellationTokens = num(db.prepare('SELECT count(*) AS n FROM auth_tokens').get()?.n);
                 counts.auth_tokens = (counts.auth_tokens ?? 0) - cancellationTokens;
-                for (const table of ['auth_sessions', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery'])
+                for (const table of ['auth_sessions', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist', 'auth_signups', 'auth_factor_recovery', 'auth_second_factor_proofs', 'auth_trusted_devices'])
                     db.prepare('DELETE FROM ' + table).run();
                 counts.auth_cases = Number(db.prepare("UPDATE auth_cases SET data=json_set(data,'$.status','closed') WHERE json_extract(data,'$.status')='pending'").run().changes);
                 db.prepare("UPDATE auth_meta SET value=? WHERE key='configuration'").run(nextRevision);
@@ -412,39 +478,78 @@ if (!isMainThread && workerData?.authStore) {
             const now = Number(args.now);
             let value: unknown;
             switch (operation) {
-
                 case 'factorRecoveryBegin': {
-                    if(!options.securityPolicy.allowEmailFactorRecovery)error(403,'factor_recovery_disabled');
+                    if (!options.securityPolicy.allowEmailFactorRecovery)
+                        error(403, 'factor_recovery_disabled');
                     db.prepare('DELETE FROM auth_factor_recovery WHERE account_id IN (SELECT account_id FROM auth_factor_recovery WHERE expires<=? LIMIT 1000)').run(now);
-                    const user=decode(db.prepare('SELECT data FROM auth_accounts WHERE email=?').get(String(args.email)));
-                    if(!user||user.status!=='active'||!user.emailVerified||(!user.totpSecret&&!user.mfaRecoveryRequired)){value=false;break;}
-                    if(db.prepare('SELECT account_id FROM auth_factor_recovery WHERE account_id=?').get(user.id)){value=false;break;}
-                    if(num(db.prepare('SELECT count(*) AS n FROM auth_factor_recovery').get()?.n)>=10000)error(503,'auth_capacity_reached');
-                    db.prepare('INSERT INTO auth_factor_recovery VALUES(?,?,?,?,?,NULL,?)').run(user.id,String(args.verification),String(args.cancellation),String(args.browser),user.version,now+172800000);
-                    audit(user.id,'factor_recovery.requested',user.id,now);value=true;break;
+                    const user = decode(db.prepare('SELECT data FROM auth_accounts WHERE email=?').get(String(args.email)));
+                    if (!user || user.status !== 'active' || !user.emailVerified || (!user.totpSecret && !passkeyFactor(user) && !user.mfaRecoveryRequired)) {
+                        value = false;
+                        break;
+                    }
+                    if (db.prepare('SELECT account_id FROM auth_factor_recovery WHERE account_id=?').get(user.id)) {
+                        value = false;
+                        break;
+                    }
+                    if (num(db.prepare('SELECT count(*) AS n FROM auth_factor_recovery').get()?.n) >= 10000)
+                        error(503, 'auth_capacity_reached');
+                    db.prepare('INSERT INTO auth_factor_recovery VALUES(?,?,?,?,?,NULL,?)').run(user.id, String(args.verification), String(args.cancellation), String(args.browser), user.version, now + 172800000);
+                    audit(user.id, 'factor_recovery.requested', user.id, now);
+                    value = true;
+                    break;
                 }
                 case 'factorRecoveryConfirm': {
-                    if(!options.securityPolicy.allowEmailFactorRecovery)error(403,'factor_recovery_disabled');
-                    const row=db.prepare('SELECT * FROM auth_factor_recovery WHERE verification_hash=? AND browser_hash=? AND expires>?').get(String(args.verification),String(args.browser),now);
-                    if(!row)error(400,'invalid_recovery_token');const user=active(String(row!.account_id));
-                    if(user.version!==row!.version||!user.emailVerified||(!user.totpSecret&&!user.mfaRecoveryRequired))error(409,'recovery_account_changed');
-                    const completeAfter=row!.complete_after===null?now+86400000:num(row!.complete_after),expires=row!.complete_after===null?now+172800000:num(row!.expires);
-                    db.prepare('UPDATE auth_factor_recovery SET complete_after=?,expires=? WHERE account_id=?').run(completeAfter,expires,user.id);
-                    audit(user.id,'factor_recovery.email_proved',user.id,now);value={completeAfter,expires};break;
+                    if (!options.securityPolicy.allowEmailFactorRecovery)
+                        error(403, 'factor_recovery_disabled');
+                    const row = db.prepare('SELECT * FROM auth_factor_recovery WHERE verification_hash=? AND browser_hash=? AND expires>?').get(String(args.verification), String(args.browser), now);
+                    if (!row)
+                        error(400, 'invalid_recovery_token');
+                    const user = active(String(row!.account_id));
+                    if (user.version !== row!.version || !user.emailVerified || (!user.totpSecret && !passkeyFactor(user) && !user.mfaRecoveryRequired))
+                        error(409, 'recovery_account_changed');
+                    const completeAfter = row!.complete_after === null ? now + 86400000 : num(row!.complete_after), expires = row!.complete_after === null ? now + 172800000 : num(row!.expires);
+                    db.prepare('UPDATE auth_factor_recovery SET complete_after=?,expires=? WHERE account_id=?').run(completeAfter, expires, user.id);
+                    audit(user.id, 'factor_recovery.email_proved', user.id, now);
+                    value = { completeAfter, expires };
+                    break;
                 }
                 case 'factorRecoveryCancel': {
-                    if(!options.securityPolicy.allowEmailFactorRecovery)error(403,'factor_recovery_disabled');
-                    const row=db.prepare('SELECT account_id FROM auth_factor_recovery WHERE cancel_hash=? AND expires>?').get(String(args.cancellation),now);if(!row)error(400,'invalid_recovery_token');
-                    db.prepare('DELETE FROM auth_factor_recovery WHERE account_id=?').run(String(row!.account_id));audit(String(row!.account_id),'factor_recovery.cancelled',String(row!.account_id),now);value=true;break;
+                    if (!options.securityPolicy.allowEmailFactorRecovery)
+                        error(403, 'factor_recovery_disabled');
+                    const row = db.prepare('SELECT account_id FROM auth_factor_recovery WHERE cancel_hash=? AND expires>?').get(String(args.cancellation), now);
+                    if (!row)
+                        error(400, 'invalid_recovery_token');
+                    db.prepare('DELETE FROM auth_factor_recovery WHERE account_id=?').run(String(row!.account_id));
+                    audit(String(row!.account_id), 'factor_recovery.cancelled', String(row!.account_id), now);
+                    value = true;
+                    break;
                 }
                 case 'factorRecoveryComplete': {
-                    if(!options.securityPolicy.allowEmailFactorRecovery)error(403,'factor_recovery_disabled');
-                    const row=db.prepare('SELECT * FROM auth_factor_recovery WHERE verification_hash=? AND browser_hash=? AND expires>?').get(String(args.verification),String(args.browser),now);if(!row)error(400,'invalid_recovery_token');
-                    if(row!.complete_after===null||num(row!.complete_after)>now)error(409,'factor_recovery_cooldown');
-                    const user=active(String(row!.account_id));if(user.version!==row!.version||!user.emailVerified||(!user.totpSecret&&!user.mfaRecoveryRequired))error(409,'recovery_account_changed');
-                    delete user.totpSecret;delete user.totpPending;delete user.totpPendingUntil;user.totpCounter=-1;user.mfaRecoveryRequired=true;user.version++;save(user);
-                    for(const table of ['auth_sessions','auth_tokens','auth_recovery','auth_email_codes','auth_email_changes','auth_factor_recovery'])db.prepare('DELETE FROM '+table+' WHERE account_id=?').run(user.id);
-                    const sessionValue={...args.session as unknown as SessionRecord,accountId:user.id,recoveryEnrollment:1};addSession(sessionValue);audit(user.id,'factor_recovery.enrollment_required',user.id,now);value=user;break;
+                    if (!options.securityPolicy.allowEmailFactorRecovery)
+                        error(403, 'factor_recovery_disabled');
+                    const row = db.prepare('SELECT * FROM auth_factor_recovery WHERE verification_hash=? AND browser_hash=? AND expires>?').get(String(args.verification), String(args.browser), now);
+                    if (!row)
+                        error(400, 'invalid_recovery_token');
+                    if (row!.complete_after === null || num(row!.complete_after) > now)
+                        error(409, 'factor_recovery_cooldown');
+                    const user = active(String(row!.account_id));
+                    if (user.version !== row!.version || !user.emailVerified || (!user.totpSecret && !passkeyFactor(user) && !user.mfaRecoveryRequired))
+                        error(409, 'recovery_account_changed');
+                    delete user.totpSecret;
+                    delete user.mfaPasskeys;
+                    delete user.totpPending;
+                    delete user.totpPendingUntil;
+                    user.totpCounter = -1;
+                    user.mfaRecoveryRequired = true;
+                    user.version++;
+                    save(user);
+                    for (const table of ['auth_sessions', 'auth_tokens', 'auth_recovery', 'auth_email_codes', 'auth_email_changes', 'auth_factor_recovery'])
+                        db.prepare('DELETE FROM ' + table + ' WHERE account_id=?').run(user.id);
+                    const sessionValue = { ...args.session as unknown as SessionRecord, accountId: user.id, recoveryEnrollment: 1 };
+                    addSession(sessionValue);
+                    audit(user.id, 'factor_recovery.enrollment_required', user.id, now);
+                    value = user;
+                    break;
                 }
                 case 'configurationRevision':
                     value = configurationRevision;
@@ -475,6 +580,79 @@ if (!isMainThread && workerData?.authStore) {
                         return true;
                     });
                     break;
+                case 'factorProof': {
+                    if (!options.securityPolicy.allowPasskeySecondFactor)
+                        error(403, 'second_factor_unavailable');
+                    const proof = args.proof as {
+                        credentialId: string;
+                    }, row = db.prepare('SELECT account_id FROM auth_passkeys WHERE id=?').get(proof.credentialId);
+                    if (!row)
+                        error(401, 'invalid_second_factor');
+                    const user = active(String(row!.account_id));
+                    passkeyProof(user, proof, false);
+                    db.prepare('DELETE FROM auth_second_factor_proofs WHERE hash IN (SELECT hash FROM auth_second_factor_proofs WHERE expires<=? LIMIT 1000)').run(now);
+                    if (num(db.prepare('SELECT count(*) AS n FROM auth_second_factor_proofs').get()?.n) >= 10000)
+                        error(503, 'auth_capacity_reached');
+                    db.prepare('INSERT INTO auth_second_factor_proofs VALUES(?,?,?,?,?,?)').run(String(args.hash), String(args.browser), user.id, user.version, JSON.stringify(proof), now + 300000);
+                    value = true;
+                    break;
+                }
+                case 'setPasskeyFactor': {
+                    if (!options.securityPolicy.allowPasskeySecondFactor)
+                        error(403, 'second_factor_unavailable');
+                    const found = args.enabled ? fresh(String(args.hash), now, true) : realMfa(String(args.hash), now), user = found.user;
+                    if (!db.prepare('SELECT id FROM auth_passkeys WHERE id=? AND account_id=?').get(String(args.credentialId), user.id))
+                        error(404, 'sign_in_method_not_found');
+                    if (args.enabled) {
+                        if ((!found.session.primaryMethod || found.session.primaryMethod === 'unknown') && !found.session.recoveryEnrollment || found.session.primaryCredentialId === args.credentialId)
+                            error(401, 'independent_second_factor_required');
+                        takeSecondFactor(user, { ...args, session: found.session }, now, String(args.credentialId));
+                        user.mfaPasskeys = [...new Set([...(user.mfaPasskeys ?? []), String(args.credentialId)])];
+                        delete user.mfaRecoveryRequired;
+                    }
+                    else {
+                        if (options.securityPolicy.requireMfa && !user.totpSecret && user.mfaPasskeys?.length === 1 && user.mfaPasskeys.includes(String(args.credentialId)))
+                            error(409, 'last_required_factor');
+                        user.mfaPasskeys = (user.mfaPasskeys ?? []).filter(id => id !== args.credentialId);
+                    }
+                    user.version++;
+                    save(user);
+                    db.prepare('DELETE FROM auth_sessions WHERE account_id=? AND hash<>?').run(user.id, String(args.hash));
+                    db.prepare('UPDATE auth_sessions SET mfa_authenticated_at=?,mfa_version=?,recovery_enrollment=0 WHERE hash=?').run(now, user.version, String(args.hash));
+                    audit(user.id, args.enabled ? 'passkey.factor_enabled' : 'passkey.factor_disabled', user.id, now);
+                    value = true;
+                    break;
+                }
+                case 'rememberDevice': {
+                    if (!options.securityPolicy.trustedDeviceTtlMs)
+                        error(403, 'trusted_device_unavailable');
+                    const { user } = realMfa(String(args.hash), now);
+                    if (!user.totpSecret && !passkeyFactor(user))
+                        error(403, 'second_factor_required');
+                    if (Number(args.expires) > now + options.securityPolicy.trustedDeviceTtlMs! || Number(args.expires) <= now)
+                        error(400, 'invalid_trusted_device');
+                    db.prepare('DELETE FROM auth_trusted_devices WHERE account_id=? AND (expires<=? OR version<>?)').run(user.id, now, user.version);
+                    if (num(db.prepare('SELECT count(*) AS n FROM auth_trusted_devices WHERE account_id=?').get(user.id)?.n) >= 20)
+                        error(409, 'trusted_device_limit');
+                    db.prepare('INSERT INTO auth_trusted_devices VALUES(?,?,?,?,?,?,?)').run(String(args.deviceHash), String(args.deviceId), user.id, user.version, String(args.label), now, Number(args.expires));
+                    audit(user.id, 'device.trusted', String(args.deviceId), now);
+                    value = true;
+                    break;
+                }
+                case 'trustedDevices': {
+                    const found = session(String(args.hash), now);
+                    if (!found || found.session.impersonatorId)
+                        error(401, 'invalid_credentials');
+                    value = db.prepare('SELECT id,label,created,expires FROM auth_trusted_devices WHERE account_id=? AND version=? AND expires>? ORDER BY created DESC LIMIT 20').all(found!.user.id, found!.user.version, now);
+                    break;
+                }
+                case 'revokeTrustedDevice': {
+                    const { user } = realMfa(String(args.hash), now);
+                    db.prepare('DELETE FROM auth_trusted_devices WHERE id=? AND account_id=?').run(String(args.deviceId), user.id);
+                    audit(user.id, 'device.trust_revoked', String(args.deviceId), now);
+                    value = true;
+                    break;
+                }
                 case 'signupBegin': {
                     db.prepare('DELETE FROM auth_signups WHERE hash IN (SELECT hash FROM auth_signups WHERE expires<=? LIMIT 1000)').run(now);
                     if (num(db.prepare('SELECT count(*) AS n FROM auth_signups').get()?.n) >= 10000)
@@ -550,6 +728,8 @@ if (!isMainThread && workerData?.authStore) {
                             error(409, 'credential_already_registered');
                         db.prepare('INSERT INTO auth_passkeys VALUES(?,?,?,?)').run(passkey.id, user.id, JSON.stringify(passkey), passkey.counter);
                     }
+                    if (credential.passkey)
+                        Object.assign(args.session!, { primaryMethod: 'passkey', primaryCredentialId: credential.passkey.id });
                     if ((args.session as unknown as SessionRecord).accountId !== user.id)
                         error(400, 'invalid_signup_flow');
                     const newDevice = addSession(args.session as unknown as SessionRecord);
@@ -608,26 +788,14 @@ if (!isMainThread && workerData?.authStore) {
                         }
                         if (args.oldHash) {
                             const previous = session(String(args.oldHash), now);
-                            if(previous?.session.recoveryEnrollment)(args.session as unknown as SessionRecord).recoveryEnrollment=1;
+                            if (previous?.session.recoveryEnrollment)
+                                (args.session as unknown as SessionRecord).recoveryEnrollment = 1;
                             if (!previous || previous.user.id !== user.id || previous.session.impersonatorId)
                                 error(401, 'invalid_credentials');
                         }
                         if (user.version !== args.version || user.passwordHash !== args.passwordHash)
                             error(401, 'invalid_credentials');
-                        if (user.totpSecret) {
-                            if (args.recoveryHash) {
-                                const result = db.prepare('DELETE FROM auth_recovery WHERE hash=? AND account_id=?').run(String(args.recoveryHash), user.id);
-                                if (result.changes !== 1)
-                                    error(401, 'invalid_credentials');
-                            }
-                            else {
-                                const counter = Number(args.counter);
-                                if (!Number.isSafeInteger(counter) || counter <= user.totpCounter)
-                                    error(401, 'invalid_credentials');
-                                user.totpCounter = counter;
-                                save(user);
-                            }
-                        }
+                        const actualMfa = consumeFactor(user, args, now);
                         if (args.upgradedHash) {
                             user.passwordHash = String(args.upgradedHash);
                             user.version++;
@@ -635,6 +803,8 @@ if (!isMainThread && workerData?.authStore) {
                         }
                         if (args.oldHash)
                             db.prepare('DELETE FROM auth_sessions WHERE hash=? AND account_id=?').run(String(args.oldHash), user.id);
+                        if (actualMfa)
+                            Object.assign(args.session!, { mfaAuthenticatedAt: now, mfaVersion: user.version });
                         const newDevice = addSession(args.session as unknown as SessionRecord);
                         db.prepare('DELETE FROM auth_attempts WHERE key=?').run(String(args.attemptKey));
                         audit(user.id, args.oldHash ? 'session.step_up' : 'session.login', user.id, now);
@@ -731,6 +901,7 @@ if (!isMainThread && workerData?.authStore) {
                         for (const hash of args.recoveryHashes as string[])
                             db.prepare('INSERT INTO auth_recovery VALUES(?,?)').run(hash, user.id);
                         db.prepare('DELETE FROM auth_sessions WHERE account_id=? AND hash<>?').run(user.id, String(args.hash));
+                        db.prepare('UPDATE auth_sessions SET mfa_authenticated_at=?,mfa_version=? WHERE hash=?').run(now, user.version, String(args.hash));
                         audit(user.id, 'totp.enabled', user.id, now);
                         return true;
                     });
@@ -738,8 +909,9 @@ if (!isMainThread && workerData?.authStore) {
                 case 'totpDisable':
                     value = transaction(() => {
                         const { user } = fresh(String(args.hash), now);
-                        if (user.version !== args.version || !user.totpSecret || Number(args.counter) <= user.totpCounter)
+                        if (user.version !== args.version || !user.totpSecret)
                             error(401, 'invalid_credentials');
+                        consumeFactor(user, args, now);
                         delete user.totpSecret;
                         user.totpCounter = -1;
                         user.version++;
@@ -850,7 +1022,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 case 'addPasskey':
                     value = transaction(() => {
-                        const { user } = fresh(String(args.hash), now), credential = args.credential as Record<string, unknown>;
+                        const { user } = fresh(String(args.hash), now, true), credential = args.credential as Record<string, unknown>;
                         if (num(db.prepare('SELECT count(*) AS n FROM auth_passkeys WHERE account_id=?').get(user.id)?.n) >= 16)
                             error(409, 'credential_limit');
                         if (db.prepare('SELECT id FROM auth_passkeys WHERE id=?').get(String(credential.id)))
@@ -869,7 +1041,7 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 }
                 case 'listPasskeys':
-                    value = db.prepare('SELECT data,counter FROM auth_passkeys WHERE account_id=? LIMIT 16').all(String(args.accountId)).map(row => ({ ...JSON.parse(String(row.data)), counter: Number(row.counter) }));
+                    value = db.prepare('SELECT data,counter FROM auth_passkeys WHERE account_id=? LIMIT 16').all(String(args.accountId)).map(row => ({ ...JSON.parse(String(row.data)), counter: Number(row.counter), secondFactor: Boolean(options.securityPolicy.allowPasskeySecondFactor && account(String(args.accountId))?.mfaPasskeys?.includes(String(JSON.parse(String(row.data)).id))) }));
                     break;
                 case 'advancePasskey':
                     value = transaction(() => {
@@ -956,6 +1128,7 @@ if (!isMainThread && workerData?.authStore) {
                             if (!target!.passwordHash && num(db.prepare('SELECT count(*) AS n FROM auth_external WHERE account_id=?').get(target!.id)?.n) === 0 && num(db.prepare('SELECT count(*) AS n FROM auth_passkeys WHERE account_id=?').get(target!.id)?.n) > 0)
                                 error(409, 'last_sign_in_method');
                             delete target!.totpSecret;
+                            delete target!.mfaPasskeys;
                             delete target!.totpPending;
                             delete target!.totpPendingUntil;
                             target!.totpCounter = -1;
@@ -1143,7 +1316,7 @@ if (!isMainThread && workerData?.authStore) {
                         const user = active(String(row!.account_id));
                         if (user.version !== args.version || user.version !== row!.version)
                             error(400, 'invalid_code');
-                        consumeFactor(user, args);
+                        const actualMfa = consumeFactor(user, args, now);
                         db.prepare('DELETE FROM auth_email_codes WHERE hash=?').run(String(args.hash));
                         if (options.securityPolicy.requireEmailVerification && !user.emailVerified) {
                             db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(user.id);
@@ -1151,6 +1324,8 @@ if (!isMainThread && workerData?.authStore) {
                         }
                         user.emailVerified = true;
                         save(user);
+                        if (actualMfa)
+                            Object.assign(args.session!, { mfaAuthenticatedAt: now, mfaVersion: user.version });
                         const newDevice = addSession(args.session as unknown as SessionRecord);
                         audit(user.id, 'session.email_login', user.id, now);
                         metric('success', 'email-code', now);
@@ -1162,7 +1337,7 @@ if (!isMainThread && workerData?.authStore) {
                         const { user } = fresh(String(args.hash), now);
                         if (user.version !== args.version)
                             error(401, 'invalid_credentials');
-                        consumeFactor(user, args);
+                        consumeFactor(user, args, now);
                         user.passwordHash = String(args.passwordHash);
                         user.version++;
                         save(user);
@@ -1177,7 +1352,7 @@ if (!isMainThread && workerData?.authStore) {
                         const { user } = fresh(String(args.hash), now);
                         if (user.version !== args.version)
                             error(401, 'invalid_credentials');
-                        consumeFactor(user, args);
+                        consumeFactor(user, args, now);
                         if (admin(user.roles) && num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n) <= 1)
                             error(409, 'last_administrator_required');
                         user.status = 'pending-delete';
@@ -1235,6 +1410,11 @@ if (!isMainThread && workerData?.authStore) {
                         const count = Number(Boolean(user.passwordHash)) + num(db.prepare('SELECT count(*) AS n FROM auth_passkeys WHERE account_id=?').get(user.id)?.n) + num(db.prepare('SELECT count(*) AS n FROM auth_external WHERE account_id=?').get(user.id)?.n);
                         if (count <= 1)
                             error(409, 'last_sign_in_method');
+                        if (args.credentialId && user.mfaPasskeys?.includes(String(args.credentialId))) {
+                            if (options.securityPolicy.requireMfa && !user.totpSecret && user.mfaPasskeys.length === 1)
+                                error(409, 'last_required_factor');
+                            user.mfaPasskeys = user.mfaPasskeys.filter(id => id !== args.credentialId);
+                        }
                         const removed = args.credentialId ? db.prepare('DELETE FROM auth_passkeys WHERE id=? AND account_id=?').run(String(args.credentialId), user.id) : db.prepare('DELETE FROM auth_external WHERE provider=? AND subject=? AND account_id=?').run(String(args.provider), String(args.subject), user.id);
                         if (removed.changes !== 1)
                             error(404, 'sign_in_method_not_found');
@@ -1281,7 +1461,7 @@ if (!isMainThread && workerData?.authStore) {
                 case 'cleanup':
                     value = transaction(() => {
                         let remaining = Number(args.limit), removed = 0;
-                        for (const [table, predicate, params] of [['auth_sessions', 'expires<=? OR last_seen<=?', [now, now - options.sessionIdleMs]], ['auth_tokens', 'expires<=?', [now]], ['auth_flows', 'expires<=?', [now]], ['auth_signups', 'expires<=?', [now]], ['auth_factor_recovery','expires<=?',[now]], ['auth_email_codes', 'expires<=?', [now]], ['auth_email_changes', 'expires<=?', [now]], ['auth_invites', 'expires<=?', [now]], ['auth_attempts', 'expires<=?', [now]], ['auth_cases', "json_extract(data,'$.expires')<=?", [now - 2592000000]]] as [
+                        for (const [table, predicate, params] of [['auth_sessions', 'expires<=? OR last_seen<=?', [now, now - options.sessionIdleMs]], ['auth_tokens', 'expires<=?', [now]], ['auth_flows', 'expires<=?', [now]], ['auth_signups', 'expires<=?', [now]], ['auth_second_factor_proofs', 'expires<=?', [now]], ['auth_trusted_devices', 'expires<=?', [now]], ['auth_factor_recovery', 'expires<=?', [now]], ['auth_email_codes', 'expires<=?', [now]], ['auth_email_changes', 'expires<=?', [now]], ['auth_invites', 'expires<=?', [now]], ['auth_attempts', 'expires<=?', [now]], ['auth_cases', "json_extract(data,'$.expires')<=?", [now - 2592000000]]] as [
                             string,
                             string,
                             number[]
@@ -1306,7 +1486,7 @@ if (!isMainThread && workerData?.authStore) {
                             error(409, 'email_change_pending');
                         if (db.prepare('SELECT id FROM auth_accounts WHERE email=?').get(String(args.email)))
                             error(409, 'email_unavailable');
-                        consumeFactor(user, args);
+                        consumeFactor(user, args, now);
                         db.prepare('DELETE FROM auth_email_changes WHERE account_id=?').run(user.id);
                         db.prepare('INSERT INTO auth_email_changes VALUES(?,?,?,?,?,?,?)').run(user.id, String(args.email), String(args.verificationHash), String(args.cancelHash), now + 86400000, now + 172800000, user.version);
                         audit(user.id, 'email.change_requested', user.id, now);

@@ -1,3 +1,4 @@
+import type { ManualRecoveryDelivery } from './manual-recovery.ts';
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import type { SESv2ClientConfig } from '@aws-sdk/client-sesv2';
 import { randomUUID } from 'node:crypto';
@@ -38,6 +39,7 @@ export interface EmailSender extends TokenSender {
     sendEmailCode(message: EmailCodeMessage): Promise<void>;
     sendSignupCode(message: SignupCodeMessage): Promise<void>;
     sendFactorRecovery(message: FactorRecoveryMessage): Promise<void>;
+    sendManualRecovery(message: ManualRecoveryDelivery): Promise<void>;
     notify(message: SecurityNotice): Promise<void>;
     close(): void;
 }
@@ -117,6 +119,13 @@ function sender(where: {
             confirm.searchParams.set('token', message.verificationToken);
             cancel.searchParams.set('token', message.cancelToken);
             await send({ email: normalizeEmail(message.email), subject: 'Second-factor recovery requested', text: `Someone requested recovery of your account second factor. Confirm in the browser where you started recovery:\n\n${confirm.href}\n\nConfirmation starts a 24-hour waiting period. After that period, return to the confirmation link to finish recovery and enroll a new second factor. Existing sessions will be revoked when recovery completes.\n\nIf this was not you, cancel the request before it completes:\n\n${cancel.href}\n\nNever share these links.` }, message.signal);
+        }, async sendManualRecovery(message: ManualRecoveryDelivery) {
+            if (!message || typeof message.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(message.token))
+                throw new Error('Invalid manual recovery delivery');
+            const email = normalizeEmail(message.email), oldEmail = normalizeEmail(message.oldEmail), url = new URL(where.mount + '/restore-access', where.origin);
+            url.searchParams.set('token', message.token);
+            await send({ email: oldEmail, subject: 'Manual account recovery approved', text: 'Two administrators approved a manual recovery request for your account. Completing recovery will replace your sign-in methods and revoke existing sessions. If you did not request this, contact the account operator immediately.' }, message.signal);
+            await send({ email, subject: 'Restore account access', text: `Two administrators approved your account recovery. Choose a new password and enroll a second factor at:\n\n${url.href}\n\nThis link expires in 30 minutes. Your existing sign-in methods and sessions will be revoked when recovery completes. Never share this link.` }, message.signal);
         }, async notify(message: SecurityNotice) {
             if (!message || !Object.hasOwn(events, message.event))
                 throw new Error('Invalid security notice');
