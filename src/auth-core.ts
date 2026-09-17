@@ -60,6 +60,18 @@ export interface AuthSession {
     lastSeen?: number;
     deviceLabel?: string;
 }
+export interface AuthDailyMetric {
+    day: string;
+    signUps: number;
+    signIns: number;
+    failedSignIns: number;
+    methods: {
+        method: string;
+        signUps: number;
+        signIns: number;
+        failedSignIns: number;
+    }[];
+}
 export interface AuthAuditEvent {
     id: number;
     actor: string;
@@ -346,6 +358,14 @@ export interface AuthService {
         accountId: string;
         reason: string;
     }): Promise<AuthSessionResult>;
+    adminBulk(input: {
+        actorToken: string;
+        accountIds: string[];
+        action: 'lock' | 'unlock' | 'revoke-sessions';
+        reason: string;
+    }): Promise<{
+        affected: number;
+    }>;
     dashboard(): Promise<{
         users: number;
         active: number;
@@ -353,6 +373,7 @@ export interface AuthService {
         pendingDeletion: number;
         sessions: number;
         waitlist: number;
+        daily: AuthDailyMetric[];
     }>;
     listAllSessions(options?: {
         limit?: number;
@@ -1084,6 +1105,10 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             }>('impersonate', { hash: digest(input.actorToken), accountId: input.accountId, session: session.value, reason: why, now: now() });
             return { user: publicUser(result.user), token: session.raw, principal: principal(result.user, result.session) };
         },
+        async adminBulk(input) { check(); const why = reason(input.reason); if (!validToken(input.actorToken) || !why.trim() || !['lock', 'unlock', 'revoke-sessions'].includes(input.action) || !Array.isArray(input.accountIds) || input.accountIds.length < 1 || input.accountIds.length > 50 || new Set(input.accountIds).size !== input.accountIds.length)
+            fail(400, 'invalid_bulk_action'); const accountIds = input.accountIds.map(id); return store.call<{
+            affected: number;
+        }>('adminBulk', { hash: digest(input.actorToken), accountIds, action: input.action, reason: why, now: now() }); },
         async dashboard() {
             check();
             return store.call<{
@@ -1093,6 +1118,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
                 pendingDeletion: number;
                 sessions: number;
                 waitlist: number;
+                daily: AuthDailyMetric[];
             }>('dashboard', { now: now() });
         },
         async listAllSessions(options) {
@@ -1289,5 +1315,21 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
                 value.fill(0);
         },
     };
+    const withFailureMetric = async <T>(method: string, run: () => Promise<T>): Promise<T> => { try {
+        return await run();
+    }
+    catch (error) {
+        if (error instanceof AuthError && [400, 401, 429].includes(error.status)) {
+            try {
+                await store.call('signInFailure', { method, now: now() });
+            }
+            catch { /* Observability cannot change the authentication result. */ }
+        }
+        throw error;
+    } };
+    const passwordLogin = service.login, externalLogin = service.issueSession, codeLogin = service.consumeEmailCode;
+    service.login = input => withFailureMetric('password', () => passwordLogin(input));
+    service.issueSession = (accountId, input) => withFailureMetric(input.method === 'passkey' ? 'passkey' : 'oidc', () => externalLogin(accountId, input));
+    service.consumeEmailCode = input => withFailureMetric('email-code', () => codeLogin(input));
     return service;
 }

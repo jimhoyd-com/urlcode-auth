@@ -488,6 +488,67 @@ test('account-wide session revocation invalidates pending primary proof and admi
     await service.revokeSessions(admin.user.id);
     assert.equal(await service.authenticate(impersonated.token), null);
 });
-test('bounded deletion purge selects due accounts before applying its page limit',async t=>{
- const {service,advance}=await setup(t),first=await service.register({email:'later-deletion@example.com',password}),second=await service.register({email:'earlier-deletion@example.com',password});await service.deleteAccount({token:second.token,password});advance(86400000);const fresh=await service.login({email:first.user.email,password});await service.deleteAccount({token:fresh.token,password});advance(6*86400000+1);assert.deepEqual(await service.purgeDeleted({limit:1}),{purged:1});assert.equal(await service.getUser(second.user.id),null);assert.equal((await service.getUser(first.user.id))?.status,'pending-delete');
+test('bounded deletion purge selects due accounts before applying its page limit', async (t) => {
+    const { service, advance } = await setup(t), first = await service.register({ email: 'later-deletion@example.com', password }), second = await service.register({ email: 'earlier-deletion@example.com', password });
+    await service.deleteAccount({ token: second.token, password });
+    advance(86400000);
+    const fresh = await service.login({ email: first.user.email, password });
+    await service.deleteAccount({ token: fresh.token, password });
+    advance(6 * 86400000 + 1);
+    assert.deepEqual(await service.purgeDeleted({ limit: 1 }), { purged: 1 });
+    assert.equal(await service.getUser(second.user.id), null);
+    assert.equal((await service.getUser(first.user.id))?.status, 'pending-delete');
+});
+test('dashboard keeps exactly thirty UTC days of bounded method and outcome aggregates', async (t) => {
+    const { service, advance } = await setup(t), user = await service.register({ email: 'metrics@example.com', password });
+    await assert.rejects(service.login({ email: user.user.email, password: 'incorrect' }), { code: 'invalid_credentials' });
+    await service.login({ email: user.user.email, password });
+    const external = await service.createExternalAccount({ email: 'metrics-oidc@example.com', provider: 'oidc', subject: 'metrics', emailVerified: true });
+    await service.issueSession(external.id, { method: 'oidc', proof: (await service.getExternalProof('oidc', 'metrics'))!.proof });
+    const code = await service.issueEmailCode({ email: user.user.email });
+    await service.consumeEmailCode({ flowId: code.flowId, code: code.code! });
+    const first = await service.dashboard();
+    assert.equal(first.daily.length, 30);
+    const today = first.daily.at(-1)!;
+    assert.equal(today.signUps, 2);
+    assert.equal(today.signIns, 3);
+    assert.equal(today.failedSignIns, 1);
+    assert.deepEqual(today.methods.map(row => row.method), ['email-code', 'oidc', 'password']);
+    assert.equal(today.methods.find(row => row.method === 'password')?.failedSignIns, 1);
+    advance(86400000);
+    await service.login({ email: user.user.email, password });
+    const next = await service.dashboard();
+    assert.equal(next.daily.at(-2)?.signIns, 3);
+    assert.equal(next.daily.at(-1)?.signIns, 1);
+    advance(30 * 86400000);
+    await service.login({ email: user.user.email, password });
+    const expired = await service.dashboard();
+    assert.equal(expired.daily.reduce((sum, row) => sum + row.signIns, 0), 1);
+    assert.equal(expired.daily.reduce((sum, row) => sum + row.signUps, 0), 0);
+});
+test('bulk administration validates every subject before mutation and audits each successful target', async (t) => {
+    const { service } = await setup(t), admin = await service.bootstrapAdmin({ email: 'bulk-owner@example.com', password }), manager = await service.register({ email: 'bulk-manager@example.com', password }), one = await service.register({ email: 'bulk-one@example.com', password }), two = await service.register({ email: 'bulk-two@example.com', password });
+    await service.adminSetRoles({ actorToken: admin.token, accountId: manager.user.id, roles: ['manager'] });
+    const actor = await service.login({ email: manager.user.email, password });
+    await assert.rejects(service.adminBulk({ actorToken: actor.token, accountIds: [one.user.id, admin.user.id], action: 'lock', reason: 'review' }), { code: 'delegation_ceiling_exceeded' });
+    assert.equal((await service.getUser(one.user.id))?.status, 'active');
+    assert.ok(await service.authenticate(one.token));
+    assert.deepEqual(await service.adminBulk({ actorToken: actor.token, accountIds: [one.user.id, two.user.id], action: 'lock', reason: 'confirmed security action' }), { affected: 2 });
+    assert.equal((await service.getUser(one.user.id))?.status, 'locked');
+    assert.equal(await service.authenticate(two.token), null);
+    assert.equal((await service.listAudit({ action: 'admin.bulk.lock' })).events.length, 2);
+    await service.adminBulk({ actorToken: actor.token, accountIds: [one.user.id, two.user.id], action: 'unlock', reason: 'review complete' });
+    const signed = await service.login({ email: one.user.email, password });
+    await service.adminBulk({ actorToken: actor.token, accountIds: [one.user.id, two.user.id], action: 'revoke-sessions', reason: 'rotate access' });
+    assert.equal(await service.authenticate(signed.token), null);
+    await assert.rejects(service.adminBulk({ actorToken: admin.token, accountIds: [one.user.id, admin.user.id], action: 'lock', reason: 'self target' }), { code: 'self_administration_denied' });
+    assert.equal((await service.getUser(one.user.id))?.status, 'active');
+});
+test('bulk administration rejects empty, duplicate, oversized and missing targets without partial changes', async (t) => {
+    const { service } = await setup(t), admin = await service.bootstrapAdmin({ email: 'bulk-bounds@example.com', password }), user = await service.register({ email: 'bulk-bound-user@example.com', password });
+    for (const accountIds of [[], [user.user.id, user.user.id], Array.from({ length: 51 }, (_, index) => 'target-' + index)])
+        await assert.rejects(service.adminBulk({ actorToken: admin.token, accountIds, action: 'lock', reason: 'bounds' }), { code: 'invalid_bulk_action' });
+    await assert.rejects(service.adminBulk({ actorToken: admin.token, accountIds: [user.user.id, 'missing'], action: 'lock', reason: 'missing user' }), { code: 'account_not_found' });
+    assert.equal((await service.getUser(user.user.id))?.status, 'active');
+    assert.equal((await service.listAudit({ action: 'admin.bulk.lock' })).events.length, 0);
 });

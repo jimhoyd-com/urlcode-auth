@@ -156,7 +156,10 @@ if (!isMainThread && workerData?.authStore) {
     const decode = (row: Record<string, SQLOutputValue> | undefined): AuthRecord | null => row ? JSON.parse(String(row.data)) as AuthRecord : null;
     const account = (id: string) => decode(db.prepare('SELECT data FROM auth_accounts WHERE id=?').get(id));
     const save = (record: AuthRecord) => db.prepare('UPDATE auth_accounts SET data=?,status=?,administrator=? WHERE id=?').run(JSON.stringify(record), record.status, Number(admin(record.roles)), record.id);
-    const audit = (actor: string, action: string, subject: string, now: number, reason = '') => { db.prepare('INSERT INTO auth_audit(actor,action,subject,created,reason) VALUES(?,?,?,?,?)').run(actor, action, subject, now, reason); db.prepare('DELETE FROM auth_audit WHERE id <= (SELECT max(id)-100000 FROM auth_audit)').run(); };
+    const metric = (event: 'signup' | 'success' | 'failure', method: string, now: number, count = 1) => { const day = Math.floor(now / 86400000); if (!['password', 'passkey', 'oidc', 'email-code', 'unknown'].includes(method))
+        method = 'unknown'; db.prepare('DELETE FROM auth_daily_metrics WHERE day<?').run(day - 29); db.prepare('INSERT INTO auth_daily_metrics(day,method,event,count) VALUES(?,?,?,?) ON CONFLICT(day,method,event) DO UPDATE SET count=count+excluded.count').run(day, method, event, count); };
+    const audit = (actor: string, action: string, subject: string, now: number, reason = '') => { db.prepare('INSERT INTO auth_audit(actor,action,subject,created,reason) VALUES(?,?,?,?,?)').run(actor, action, subject, now, reason); db.prepare('DELETE FROM auth_audit WHERE id <= (SELECT max(id)-100000 FROM auth_audit)').run(); if (['account.register', 'admin.bootstrap', 'registration.approved', 'admin.account_created', 'account.external_register', 'accounts.imported'].includes(action))
+        metric('signup', action === 'account.external_register' ? 'oidc' : action === 'accounts.imported' ? 'unknown' : 'password', now, action === 'accounts.imported' ? Number(subject) : 1); };
     const transaction = <T>(fn: () => T): T => {
         db.exec('BEGIN IMMEDIATE');
         try {
@@ -264,7 +267,7 @@ if (!isMainThread && workerData?.authStore) {
    CREATE TABLE auth_passkeys(id TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,data TEXT NOT NULL,counter INTEGER NOT NULL);CREATE INDEX auth_passkey_account ON auth_passkeys(account_id);
    PRAGMA application_id=1430345032;PRAGMA user_version=1;`);
             });
-        db.exec('CREATE TABLE IF NOT EXISTS auth_devices(account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,hash TEXT NOT NULL,label TEXT NOT NULL,last_seen INTEGER NOT NULL,PRIMARY KEY(account_id,hash));CREATE TABLE IF NOT EXISTS auth_email_changes(account_id TEXT PRIMARY KEY REFERENCES auth_accounts(id) ON DELETE CASCADE,email TEXT NOT NULL,verification_hash TEXT UNIQUE NOT NULL,cancel_hash TEXT UNIQUE NOT NULL,activate_after INTEGER NOT NULL,expires INTEGER NOT NULL,version INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_email_codes(hash TEXT PRIMARY KEY,account_id TEXT NOT NULL UNIQUE REFERENCES auth_accounts(id) ON DELETE CASCADE,code_hash TEXT NOT NULL,expires INTEGER NOT NULL,attempts INTEGER NOT NULL,version INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_cases(id TEXT PRIMARY KEY,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS auth_invites(hash TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,expires INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_waitlist(id TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created INTEGER NOT NULL,profile TEXT);');
+        db.exec('CREATE TABLE IF NOT EXISTS auth_daily_metrics(day INTEGER NOT NULL,method TEXT NOT NULL,event TEXT NOT NULL,count INTEGER NOT NULL,PRIMARY KEY(day,method,event));CREATE TABLE IF NOT EXISTS auth_devices(account_id TEXT NOT NULL REFERENCES auth_accounts(id) ON DELETE CASCADE,hash TEXT NOT NULL,label TEXT NOT NULL,last_seen INTEGER NOT NULL,PRIMARY KEY(account_id,hash));CREATE TABLE IF NOT EXISTS auth_email_changes(account_id TEXT PRIMARY KEY REFERENCES auth_accounts(id) ON DELETE CASCADE,email TEXT NOT NULL,verification_hash TEXT UNIQUE NOT NULL,cancel_hash TEXT UNIQUE NOT NULL,activate_after INTEGER NOT NULL,expires INTEGER NOT NULL,version INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_email_codes(hash TEXT PRIMARY KEY,account_id TEXT NOT NULL UNIQUE REFERENCES auth_accounts(id) ON DELETE CASCADE,code_hash TEXT NOT NULL,expires INTEGER NOT NULL,attempts INTEGER NOT NULL,version INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_cases(id TEXT PRIMARY KEY,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS auth_invites(hash TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,expires INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS auth_waitlist(id TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created INTEGER NOT NULL,profile TEXT);');
         if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'impersonator_id'))
             db.exec('ALTER TABLE auth_sessions ADD COLUMN impersonator_id TEXT;ALTER TABLE auth_sessions ADD COLUMN actor_version INTEGER;');
         if (!db.prepare('PRAGMA table_info(auth_waitlist)').all().some(row => row.name === 'profile'))
@@ -428,6 +431,10 @@ if (!isMainThread && workerData?.authStore) {
                         const newDevice = addSession(args.session as unknown as SessionRecord);
                         db.prepare('DELETE FROM auth_attempts WHERE key=?').run(String(args.attemptKey));
                         audit(user.id, args.oldHash ? 'session.step_up' : 'session.login', user.id, now);
+                        if (!args.oldHash)
+                            metric('success', args.proof ? String((args.proof as {
+                                kind: string;
+                            }).kind) : 'password', now);
                         return { ...user, ...(typeof newDevice !== 'undefined' && newDevice ? { newDevice: true } : {}) };
                     });
                     break;
@@ -925,6 +932,7 @@ if (!isMainThread && workerData?.authStore) {
                         save(user);
                         const newDevice = addSession(args.session as unknown as SessionRecord);
                         audit(user.id, 'session.email_login', user.id, now);
+                        metric('success', 'email-code', now);
                         return { ...user, ...(typeof newDevice !== 'undefined' && newDevice ? { newDevice: true } : {}) };
                     });
                     break;
@@ -983,7 +991,7 @@ if (!isMainThread && workerData?.authStore) {
                     value = transaction(() => {
                         let purged = 0;
                         const deleted: string[] = [];
-                        for (const row of db.prepare("SELECT data FROM auth_accounts WHERE status='pending-delete' AND json_extract(data,'$.deleteAfter')<=? LIMIT ?").all(now,Number(args.limit))) {
+                        for (const row of db.prepare("SELECT data FROM auth_accounts WHERE status='pending-delete' AND json_extract(data,'$.deleteAfter')<=? LIMIT ?").all(now, Number(args.limit))) {
                             const user = decode(row)!;
                             if (!user.deleteAfter || user.deleteAfter > now)
                                 continue;
@@ -1174,9 +1182,52 @@ if (!isMainThread && workerData?.authStore) {
                         return { user: target, sessions: db.prepare('SELECT id,created,authenticated_at AS authenticatedAt,expires,last_seen AS lastSeen,device_label AS deviceLabel FROM auth_sessions WHERE account_id=? AND expires>? AND last_seen>? LIMIT 20').all(target!.id, now, now - options.sessionIdleMs), identities: db.prepare('SELECT provider,subject FROM auth_external WHERE account_id=? LIMIT 16').all(target!.id) };
                     });
                     break;
+                case 'signInFailure':
+                    value = transaction(() => { metric('failure', String(args.method), now); return true; });
+                    break;
+                case 'adminBulk':
+                    value = transaction(() => { const actor = fresh(String(args.hash), now).user, p = permissions(actor.roles), action = String(args.action); if (!p.includes('*') && !p.includes(action === 'revoke-sessions' ? 'auth.sessions.manage' : 'auth.users.manage'))
+                        error(403, 'permission_denied'); const targets = (args.accountIds as string[]).map(account); for (const target of targets) {
+                        if (!target)
+                            error(404, 'account_not_found');
+                        if (target!.id === actor.id)
+                            error(403, 'self_administration_denied');
+                        if (target!.status === 'pending-delete')
+                            error(409, 'account_pending_deletion');
+                        for (const permission of permissions(target!.roles))
+                            if (!p.includes('*') && !p.includes(permission))
+                                error(403, 'delegation_ceiling_exceeded');
+                    } if (action === 'lock') {
+                        const remaining = num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n) - targets.filter(target => target!.status === 'active' && admin(target!.roles)).length;
+                        if (remaining < 1 && targets.some(target => target!.status === 'active' && admin(target!.roles)))
+                            error(409, 'last_administrator_required');
+                    } for (const target of targets) {
+                        if (action !== 'revoke-sessions')
+                            target!.status = action === 'lock' ? 'locked' : 'active';
+                        target!.version++;
+                        save(target!);
+                        db.prepare('DELETE FROM auth_sessions WHERE account_id=?').run(target!.id);
+                        audit(actor.id, 'admin.bulk.' + action, target!.id, now, String(args.reason));
+                    } return { affected: targets.length }; });
+                    break;
                 case 'dashboard': {
                     const counts = db.prepare("SELECT count(*) AS users,coalesce(sum(status='active'),0) AS active,coalesce(sum(status='locked'),0) AS locked,coalesce(sum(status='pending-delete'),0) AS pendingDeletion FROM auth_accounts").get()!;
-                    value = { ...counts, sessions: num(db.prepare('SELECT count(*) AS n FROM auth_sessions WHERE expires>? AND last_seen>?').get(now, now - options.sessionIdleMs)?.n), waitlist: num(db.prepare('SELECT count(*) AS n FROM auth_waitlist').get()?.n) };
+                    const firstDay = Math.floor(now / 86400000) - 29;
+                    const daily = Array.from({ length: 30 }, (_, offset) => ({ day: new Date((firstDay + offset) * 86400000).toISOString().slice(0, 10), signUps: 0, signIns: 0, failedSignIns: 0, methods: [] as {
+                            method: string;
+                            signUps: number;
+                            signIns: number;
+                            failedSignIns: number;
+                        }[] }));
+                    for (const row of db.prepare("SELECT day,method,sum(CASE WHEN event='signup' THEN count ELSE 0 END) AS signUps,sum(CASE WHEN event='success' THEN count ELSE 0 END) AS signIns,sum(CASE WHEN event='failure' THEN count ELSE 0 END) AS failedSignIns FROM auth_daily_metrics WHERE day>=? AND day<=? GROUP BY day,method ORDER BY day,method LIMIT 150").all(firstDay, firstDay + 29)) {
+                        const bucket = daily[num(row.day) - firstDay]!;
+                        const method = { method: String(row.method), signUps: num(row.signUps), signIns: num(row.signIns), failedSignIns: num(row.failedSignIns) };
+                        bucket.signUps += method.signUps;
+                        bucket.signIns += method.signIns;
+                        bucket.failedSignIns += method.failedSignIns;
+                        bucket.methods.push(method);
+                    }
+                    value = { ...counts, daily, sessions: num(db.prepare('SELECT count(*) AS n FROM auth_sessions WHERE expires>? AND last_seen>?').get(now, now - options.sessionIdleMs)?.n), waitlist: num(db.prepare('SELECT count(*) AS n FROM auth_waitlist').get()?.n) };
                     break;
                 }
                 case 'allSessions':
