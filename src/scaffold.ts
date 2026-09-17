@@ -35,6 +35,7 @@ try {
     encryptionKey: key,
     roles: {member: [], admin: ['*']},
     defaultRole: 'member',
+    registrationMode: 'off',
   });
 } finally { key.fill(0); }
 export default service;
