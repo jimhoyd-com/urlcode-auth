@@ -1,3 +1,4 @@
+import type {FactorRecoveryService} from './factor-recovery.ts';
 import { randomBytes, randomInt, randomUUID, createHash, createHmac, createCipheriv, createDecipheriv, scrypt, pbkdf2, timingSafeEqual } from 'node:crypto';
 import { compare as bcryptCompare } from 'bcryptjs';
 import { domainToASCII } from 'node:url';
@@ -19,6 +20,7 @@ export interface AuthUser {
 }
 export type AuthRestriction = 'verify-email' | 'enroll-mfa';
 export interface AuthSecurityPolicy {
+    allowEmailFactorRecovery?:true;
     requireEmailVerification: boolean;
     requireMfa: boolean;
     deletionGraceMs: number;
@@ -98,6 +100,8 @@ export interface AuthHookStats {
     timedOut: number;
 }
 export interface AuthOptions {
+    /** Explicit email fallback lowers MFA assurance; disabled by default. */
+    allowEmailFactorRecovery?:boolean;
     approveConfigurationChangeFrom?: string;
     configurationTag?: string;
     requireEmailVerification?: boolean;
@@ -158,7 +162,55 @@ export interface AuthCase {
     expires: number;
     targetVersion: number;
 }
-export interface AuthService {
+export interface SignupBinding {
+    flowId: string;
+    browserHash: string;
+}
+export interface SignupState {
+    flowId: string;
+    accountId: string;
+    email: string;
+    step: 'verify-email' | 'credential' | 'profile';
+    expires: number;
+}
+export interface SignupStart extends SignupState {
+    delivery?: {
+        kind: 'signup-code';
+        email: string;
+        code: string;
+    } | {
+        kind: 'registration-attempt';
+        email: string;
+    };
+}
+export interface AuthService extends FactorRecoveryService {
+    beginSignup(input: {
+        email: string;
+        browserHash: string;
+        invitationToken?: string;
+    }): Promise<SignupStart>;
+    getSignup(input: SignupBinding): Promise<SignupState | null>;
+    verifySignup(input: SignupBinding & {
+        code: string;
+    }): Promise<SignupState>;
+    setSignupPassword(input: SignupBinding & {
+        password: string;
+    }): Promise<SignupState>;
+    setSignupPasskeyChallenge(input: SignupBinding & {
+        challenge: string;
+    }): Promise<SignupState>;
+    getSignupPasskeyChallenge(input: SignupBinding): Promise<{
+        state: SignupState;
+        challenge: string;
+    }>;
+    setSignupPasskey(input: SignupBinding & {
+        challenge: string;
+        credential: Omit<AuthPasskey, 'accountId'>;
+    }): Promise<SignupState>;
+    completeSignup(input: SignupBinding & {
+        profile?: RegistrationInput;
+        device?: AuthDevice;
+    }): Promise<AuthSessionResult | null>;
     register(input: {
         email: string;
         password: string;
@@ -617,7 +669,8 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
     const deletionGraceMs = options.deletionGraceMs ?? 604800000;
     if (!Number.isSafeInteger(deletionGraceMs) || deletionGraceMs < 86400000 || deletionGraceMs > 2592000000)
         fail(400, 'invalid_deletion_grace');
-    const securityPolicy: AuthSecurityPolicy = Object.freeze({ requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
+    if(options.allowEmailFactorRecovery!==undefined&&typeof options.allowEmailFactorRecovery!=='boolean')fail(400,'invalid_factor_recovery_policy');
+    const securityPolicy: AuthSecurityPolicy = Object.freeze({ ...(options.allowEmailFactorRecovery===true?{allowEmailFactorRecovery:true as const}:{}), requireEmailVerification: options.requireEmailVerification === true, requireMfa: options.requireMfa === true, deletionGraceMs });
     const supplied = options.encryptionKeys ?? (options.encryptionKey ? { legacy: options.encryptionKey } : {}), activeKey = options.activeEncryptionKey ?? 'legacy';
     const keys: Record<string, Buffer> = Object.create(null);
     if (Object.keys(supplied).length < 1 || Object.keys(supplied).length > 8)
@@ -736,7 +789,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         return hashPassword(value);
     };
     const perms = (names: string[]) => [...new Set(names.flatMap(name => roles[name] || []))];
-    const restrictions = (user: AuthRecord): AuthRestriction[] => [...(securityPolicy.requireEmailVerification && !user.emailVerified ? ['verify-email' as const] : []), ...(securityPolicy.requireMfa && !user.totpSecret ? ['enroll-mfa' as const] : [])];
+    const restrictions = (user: AuthRecord): AuthRestriction[] => [...(securityPolicy.requireEmailVerification && !user.emailVerified ? ['verify-email' as const] : []), ...((user.mfaRecoveryRequired || securityPolicy.requireMfa && !user.totpSecret) ? ['enroll-mfa' as const] : [])];
     const principal = (user: AuthRecord, session: SessionRecord): AuthPrincipal => { const pending = restrictions(user); return { id: user.id, email: user.email, emailVerified: user.emailVerified, roles: pending.length ? [] : [...user.roles], permissions: pending.length ? [] : session.impersonatorId ? perms(user.roles).filter(p => p !== '*' && !p.startsWith('auth.') && !p.startsWith('admin.')) : perms(user.roles), ...(pending.length ? { restrictions: pending } : {}), ...(session.impersonatorId ? { impersonatorId: session.impersonatorId } : {}), sessionId: session.id, authenticatedAt: session.authenticatedAt }; };
     const sessionFor = (accountId: string, device?: AuthDevice) => {
         if (device && (!validToken(device.id) || device.label !== undefined && (typeof device.label !== 'string' || device.label.length > 160 || /[\x00-\x1f\x7f]/.test(device.label))))
@@ -776,6 +829,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(403, 'impersonation_restricted');
         if (fresh && now() - value.session.authenticatedAt > 300000)
             fail(401, 'fresh_authentication_required');
+        if(enrollment&&value.user.mfaRecoveryRequired&&!value.session.recoveryEnrollment)fail(403,'recovery_enrollment_proof_required');
         if (fresh) {
             const pending = restrictions(value.user);
             if (pending.length && (!enrollment || pending.includes('verify-email')))
@@ -870,7 +924,118 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(400, 'invalid_auth_proof');
         return structuredClone(value);
     };
+    const signupBinding = (input: SignupBinding) => {
+        check();
+        if (!validToken(input.flowId) || typeof input.browserHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.browserHash))
+            fail(400, 'invalid_signup_flow');
+        return { hash: digest(input.flowId), browser: input.browserHash, now: now() };
+    };
+    const signupState = (row: {
+        account_id: string;
+        email: string;
+        step: SignupState['step'];
+        expires: number;
+    }, flowId: string): SignupState => ({ flowId, accountId: row.account_id, email: row.email, step: row.step, expires: row.expires });
+    const signupRead = async (input: SignupBinding, step?: SignupState['step']) => {
+        const row = await store.call<{
+            account_id: string;
+            email: string;
+            step: SignupState['step'];
+            expires: number;
+            challenge: string | null;
+        } | null>('signupRead', signupBinding(input));
+        if (!row || step && row.step !== step)
+            fail(400, 'invalid_signup_flow');
+        return row!;
+    };
     const service: AuthService = {
+        getFactorRecoveryEnabled:()=>securityPolicy.allowEmailFactorRecovery===true,
+        async beginFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.browserToken))fail(400,'invalid_recovery_browser');const email=normalizeEmail(input.email);await attempt('factor-recovery:'+email);const verificationToken=token(),cancelToken=token();const issued=await store.call<boolean>('factorRecoveryBegin',{email,browser:digest(input.browserToken),verification:digest(verificationToken),cancellation:digest(cancelToken),now:now()});return {verificationToken:issued?verificationToken:null,cancelToken:issued?cancelToken:null};},
+        async confirmFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.token)||!validToken(input.browserToken))fail(400,'invalid_recovery_token');return store.call<{completeAfter:number;expires:number}>('factorRecoveryConfirm',{verification:digest(input.token),browser:digest(input.browserToken),now:now()});},
+        async cancelFactorRecovery(raw){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(raw))fail(400,'invalid_recovery_token');await store.call('factorRecoveryCancel',{cancellation:digest(raw),now:now()});},
+        async completeFactorRecovery(input){check();if(!securityPolicy.allowEmailFactorRecovery)fail(403,'factor_recovery_disabled');if(!validToken(input.token)||!validToken(input.browserToken))fail(400,'invalid_recovery_token');const raw=token(),timestamp=now();const value={id:randomUUID(),hash:digest(raw),accountId:'',created:timestamp,authenticatedAt:timestamp,expires:timestamp+Math.min(ttl,1800000)};const user=await store.call<AuthRecord>('factorRecoveryComplete',{verification:digest(input.token),browser:digest(input.browserToken),session:value,now:timestamp});value.accountId=user.id;return {user:publicUser(user),token:raw,principal:principal(user,value)};},
+
+        async beginSignup(input) {
+            check();
+            if (typeof input.browserHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.browserHash))
+                fail(400, 'invalid_signup_flow');
+            if (mode === 'off')
+                fail(403, 'registration_unavailable');
+            const email = normalizeEmail(input.email);
+            let eligible = true;
+            try {
+                permittedEmail(email);
+            }
+            catch {
+                eligible = false;
+            }
+            await attempt('signup:' + email);
+            const flowId = randomBytes(32).toString('base64url'), accountId = randomUUID(), code = String(randomInt(1000000)).padStart(6, '0');
+            const step = securityPolicy.requireEmailVerification ? 'verify-email' as const : 'credential' as const;
+            const expires = now() + 1800000;
+            const result = await store.call<{
+                existing: boolean;
+                eligible: boolean;
+            }>('signupBegin', { hash: digest(flowId), browser: input.browserHash, email, accountId, codeHash: digest(flowId + ':' + code), step, expires, eligible, invitationHash: validToken(input.invitationToken) ? digest(input.invitationToken!) : '', now: now() });
+            return { flowId, accountId, email, step, expires, ...(result.existing ? { delivery: { kind: 'registration-attempt' as const, email } } : result.eligible && securityPolicy.requireEmailVerification ? { delivery: { kind: 'signup-code' as const, email, code } } : {}) };
+        },
+        async getSignup(input) {
+            const row = await store.call<{
+                account_id: string;
+                email: string;
+                step: SignupState['step'];
+                expires: number;
+            } | null>('signupRead', signupBinding(input));
+            return row ? signupState(row, input.flowId) : null;
+        },
+        async verifySignup(input) {
+            const args = signupBinding(input);
+            const row = await store.call<{
+                account_id: string;
+                email: string;
+                step: SignupState['step'];
+                expires: number;
+            } | null>('signupVerify', { ...args, codeHash: digest(input.flowId + ':' + (typeof input.code === 'string' && /^\d{6}$/.test(input.code) ? input.code : 'invalid')) });
+            if (!row)
+                fail(400, 'invalid_signup_code');
+            return signupState(row!, input.flowId);
+        },
+        async setSignupPassword(input) {
+            await signupRead(input, 'credential');
+            const passwordHash = await newPassword(input.password);
+            await store.call('signupCredential', { ...signupBinding(input), passwordHash });
+            return signupState(await signupRead(input, 'profile'), input.flowId);
+        },
+        async setSignupPasskeyChallenge(input) {
+            if (typeof input.challenge !== 'string' || !/^[A-Za-z0-9_-]{32,1024}$/.test(input.challenge))
+                fail(400, 'invalid_passkey');
+            await store.call('signupChallenge', { ...signupBinding(input), challenge: input.challenge });
+            return signupState(await signupRead(input, 'credential'), input.flowId);
+        },
+        async getSignupPasskeyChallenge(input) {
+            const row = await signupRead(input, 'credential');
+            if (!row.challenge)
+                fail(400, 'invalid_signup_flow');
+            return { state: signupState(row, input.flowId), challenge: row.challenge! };
+        },
+        async setSignupPasskey(input) {
+            if (typeof input.challenge !== 'string' || !/^[A-Za-z0-9_-]{32,1024}$/.test(input.challenge))
+                fail(400, 'invalid_passkey');
+            const c = input.credential;
+            if (!c || typeof c.id !== 'string' || !c.id || c.id.length > 2048 || typeof c.publicKey !== 'string' || !c.publicKey || c.publicKey.length > 8192 || !Number.isSafeInteger(c.counter) || c.counter < 0 || c.transports && (!Array.isArray(c.transports) || c.transports.length > 8 || c.transports.some(t => !['ble', 'cable', 'hybrid', 'internal', 'nfc', 'smart-card', 'usb'].includes(t))))
+                fail(400, 'invalid_passkey');
+            const credential = { id: c.id, publicKey: c.publicKey, counter: c.counter, ...(c.transports ? { transports: c.transports } : {}) };
+            await store.call('signupCredential', { ...signupBinding(input), challenge: input.challenge, credential });
+            return signupState(await signupRead(input, 'profile'), input.flowId);
+        },
+        async completeSignup(input) {
+            const row = await signupRead(input, 'profile'), profile = validateProfile(input.profile ?? {}), session = sessionFor(row.account_id, input.device);
+            const stored = await store.call<AuthRecord | null>('signupComplete', { ...signupBinding(input), profile, session: session.value });
+            if (!stored)
+                return null;
+            lifecycle({ type: 'sign-up', accountId: stored.id });
+            return { user: publicUser(stored), token: session.raw, principal: principal(stored, session.value), ...(stored.newDevice ? { newDevice: true } : {}) };
+        },
         register: input => create(input), bootstrapAdmin: input => create(input, true), login,
         async stepUp(input) {
             const value = await lookupSession(input.token);

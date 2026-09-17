@@ -103,3 +103,34 @@ Migration preserves accounts, enrolled credentials and history, while revoking s
 `englishCatalogue` exports the semantic UI keys for catalogue authors. Translations are plain text and escaped at rendering; runtime templates never execute project markup. No complete non-English language pack is bundled. Dates, provider identifiers and user data retain their own values.
 
 Changing `configurationTag` deliberately advances the approved configuration revision for provider/callback/profile-policy deployments that cannot be fingerprinted as simple data. The service does not automatically fingerprint executable callbacks. Session idle and absolute limits do participate in the declared configuration fingerprint.
+
+### Verification-first signup
+
+The browser registration entry point resumes a short-lived, browser-bound signup
+wizard. With `requireEmailVerification`, it verifies an emailed numeric code before
+accepting a password or passkey; `sendSignupCode` must be configured. Credentials,
+profile and required consent are finalized together. Open/invited signup creates
+one account/session transaction; waitlist signup creates only a pending application
+until an administrator approves it. Passkey applications retain their credential
+and account binding through approval. Existing accounts are never overwritten:
+the identifier step gives the same next page and sends a registration-attempt
+notice privately. The low-level operator registration/bootstrap methods remain
+explicit privileged provisioning APIs, not public HTTP signup shortcuts.
+
+### Lost second-factor recovery
+
+`allowEmailFactorRecovery: true` explicitly enables an email fallback for verified
+accounts that lost their second factor. It is disabled by default because control
+of the mailbox becomes a recovery authority. Configure `sendFactorRecovery`; the
+bundled SES/development senders and presets provide it. The flow confirms a private
+email link in the originating browser, starts a 24-hour waiting period and provides
+a separate cancellation link. GET requests never consume either capability.
+
+Completion checks the account version, revokes sessions and pending authority,
+removes the old TOTP/recovery codes, and issues an enrollment-only session. Only that
+recovery session can enroll the replacement factor; ordinary password/provider
+logins cannot race it, even when the site's global MFA requirement is off. No
+application authority returns until the replacement factor is confirmed. Recovery
+state expires, is rate-limited, survives restart and is revoked by configuration
+migration. This is email-based factor recovery, not proof of a person's legal
+identity or the later public lost-everything workflow.

@@ -16,15 +16,28 @@ export interface EmailCodeMessage {
     code: string;
     signal: AbortSignal;
 }
+export interface SignupCodeMessage {
+    email: string;
+    code: string;
+    signal: AbortSignal;
+}
+export interface FactorRecoveryMessage {
+    email: string;
+    verificationToken: string;
+    cancelToken: string;
+    signal: AbortSignal;
+}
 export type TokenSender = (message: TokenMessage) => Promise<void>;
 export interface SecurityNotice {
     email: string;
-    event: 'new-device' | 'password-changed' | 'email-changed';
+    event: 'new-device' | 'password-changed' | 'email-changed' | 'registration-attempt';
     signal: AbortSignal;
 }
 /** A callable sendToken adapter; notify carries no credential or arbitrary markup. */
 export interface EmailSender extends TokenSender {
     sendEmailCode(message: EmailCodeMessage): Promise<void>;
+    sendSignupCode(message: SignupCodeMessage): Promise<void>;
+    sendFactorRecovery(message: FactorRecoveryMessage): Promise<void>;
     notify(message: SecurityNotice): Promise<void>;
     close(): void;
 }
@@ -37,7 +50,7 @@ interface SenderLocation {
     origin: string;
     authMount: string;
 }
-const events = { 'new-device': 'A new device signed in to your account.', 'password-changed': 'Your account password changed.', 'email-changed': 'Your account email address changed.' } as const;
+const events = { 'registration-attempt': 'Someone tried to create an account with your email address. Your existing account was not changed.', 'new-device': 'A new device signed in to your account.', 'password-changed': 'Your account password changed.', 'email-changed': 'Your account email address changed.' } as const;
 function location(options: SenderLocation, development = false): {
     origin: string;
     mount: string;
@@ -92,6 +105,18 @@ function sender(where: {
             const url = new URL(where.mount + '/email-code', where.origin);
             url.searchParams.set('flowId', message.flowId);
             await send({ email: normalizeEmail(message.email), subject: 'Your sign-in code', text: `Your sign-in code is: ${message.code}\n\nEnter it at ${url.href}\n\nIf you did not request this, ignore this email. Never share this code.` }, message.signal);
+        }, async sendSignupCode(message: SignupCodeMessage) {
+            if (!message || typeof message.code !== 'string' || !/^\d{6}$/.test(message.code))
+                throw new Error('Invalid signup code delivery');
+            const url = new URL(where.mount + '/signup', where.origin);
+            await send({ email: normalizeEmail(message.email), subject: 'Verify your email address', text: `Your signup code is: ${message.code}\n\nEnter it in the browser where you started signing up at ${url.href}\n\nIf you did not request this, ignore this email. Never share this code.` }, message.signal);
+        }, async sendFactorRecovery(message: FactorRecoveryMessage) {
+            if (!message || !/^[A-Za-z0-9_-]{43}$/.test(message.verificationToken) || !/^[A-Za-z0-9_-]{43}$/.test(message.cancelToken))
+                throw new Error('Invalid factor recovery delivery');
+            const confirm = new URL(where.mount + '/recover-factor/confirm', where.origin), cancel = new URL(where.mount + '/recover-factor/cancel', where.origin);
+            confirm.searchParams.set('token', message.verificationToken);
+            cancel.searchParams.set('token', message.cancelToken);
+            await send({ email: normalizeEmail(message.email), subject: 'Second-factor recovery requested', text: `Someone requested recovery of your account second factor. Confirm in the browser where you started recovery:\n\n${confirm.href}\n\nConfirmation starts a 24-hour waiting period. After that period, return to the confirmation link to finish recovery and enroll a new second factor. Existing sessions will be revoked when recovery completes.\n\nIf this was not you, cancel the request before it completes:\n\n${cancel.href}\n\nNever share these links.` }, message.signal);
         }, async notify(message: SecurityNotice) {
             if (!message || !Object.hasOwn(events, message.event))
                 throw new Error('Invalid security notice');

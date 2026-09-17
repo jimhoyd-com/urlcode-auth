@@ -91,3 +91,30 @@ test('email change notices distinguish verification cooldown from old-address ca
     assert.ok(rows[1]!.includes('before completion'));
     deliver.close();
 });
+
+test('signup mail keeps proof out of links and registration notices preserve existing accounts', async () => {
+    const rows: string[] = [];
+    const deliver = createSesSender({ ...base, region: 'us-east-1', from: 'operator@example.test', transport: async command => { rows.push(command.input.Content!.Simple!.Body!.Text!.Data!); } });
+    await deliver.sendSignupCode({ email: 'user@example.test', code: '123456', signal: message().signal });
+    assert.ok(rows[0]!.includes('signup code is: 123456'));
+    assert.ok(rows[0]!.includes('https://accounts.example.test/account/signup'));
+    assert.ok(!rows[0]!.includes('code='));
+    await deliver.notify({ email: 'user@example.test', event: 'registration-attempt', signal: message().signal });
+    assert.ok(rows[1]!.includes('existing account was not changed'));
+    assert.ok(!rows[1]!.includes('token='));
+    await assert.rejects(deliver.sendSignupCode({ email: 'user@example.test', code: '1234567', signal: message().signal }));
+    assert.equal(rows.length, 2);
+    deliver.close();
+});
+
+test('factor recovery mail has separate fixed-origin confirmation and cancellation capabilities', async () => {
+    const rows: string[] = [];
+    const deliver = createSesSender({ ...base, region: 'us-east-1', from: 'operator@example.test', transport: async command => { rows.push(command.input.Content!.Simple!.Body!.Text!.Data!); } });
+    await deliver.sendFactorRecovery({ email: 'user@example.test', verificationToken: 'a'.repeat(43), cancelToken: 'b'.repeat(43), signal: message().signal });
+    assert.ok(rows[0]!.includes('/account/recover-factor/confirm?token=' + 'a'.repeat(43)));
+    assert.ok(rows[0]!.includes('/account/recover-factor/cancel?token=' + 'b'.repeat(43)));
+    assert.ok(rows[0]!.includes('24-hour waiting period'));
+    await assert.rejects(deliver.sendFactorRecovery({ email: 'user@example.test', verificationToken: '../bad', cancelToken: 'b'.repeat(43), signal: message().signal }));
+    assert.equal(rows.length, 1);
+    deliver.close();
+});

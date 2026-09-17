@@ -183,28 +183,34 @@ export function httpFailure(error: unknown, request: ExtensionRequest, presentat
     const message = presentation?.textSource(source) ?? source;
     return wantsJson(request) ? jsonResponse(status, { error: message }) : pageResponse('Request could not be completed', `<p class="error" role="alert">${escapeHtml(presentation?.textSource(message) ?? message)}</p>`, status, [], undefined, presentation);
 }
+/** Proof token stays in the submitting form and is consumed once with the primary proof. */
+export function secondFactorButton(base: string, text: (source: string) => string = value => value): string {
+ return `<button type="button" data-passkey="second-factor" data-base="${escapeHtml(base)}" data-unavailable="${escapeHtml(text('Passkeys are unavailable in this browser. Use another sign-in method.'))}" data-failed="${escapeHtml(text('Passkey request failed'))}" data-cancelled="${escapeHtml(text('Passkey ceremony cancelled'))}" data-confirmed="${escapeHtml(text('Passkey confirmed. Continue signing in.'))}">${escapeHtml(text('Use a passkey as your second factor'))}</button><input type="hidden" name="secondFactorToken" value=""><p role="status" aria-live="polite" data-passkey-status></p>`;
+}
 /** Browser glue for maintained server-side WebAuthn verification. No guest scripts. */
 export const passkeyScript = String.raw `(() => {
  const decode=value=>Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
  const encode=value=>{let text='';for(const byte of new Uint8Array(value))text+=String.fromCharCode(byte);return btoa(text).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');};
  for(const button of document.querySelectorAll('[data-passkey]'))button.addEventListener('click',async()=>{
-  const status=document.querySelector('[data-passkey-status]');button.disabled=true;
+  const form=button.closest('form'),status=form?.querySelector('[data-passkey-status]')||document.querySelector('[data-passkey-status]');button.disabled=true;
   try{
    if(!window.PublicKeyCredential||!navigator.credentials)throw new Error(button.dataset.unavailable);
-   const base=button.dataset.base,kind=button.dataset.passkey,csrf=document.querySelector('input[name="csrf"]').value;
+   const base=button.dataset.base,kind=button.dataset.passkey,csrf=(form||document).querySelector('input[name="csrf"]').value;
    const post=async(path,data)=>{const response=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:JSON.stringify(data)});const result=await response.json();if(!response.ok)throw new Error(button.dataset.failed);return result;};
-   const started=await post('/passkeys/'+kind+'/options',{}),options=started.options;options.challenge=decode(options.challenge);
+   const prefix=kind==='signup'?'/signup/passkeys':kind==='second-factor'?'/second-factor':'/passkeys/'+kind;
+   const started=await post(prefix+'/options',{}),options=started.options;options.challenge=decode(options.challenge);
    if(options.user)options.user.id=decode(options.user.id);
    for(const item of options.excludeCredentials||options.allowCredentials||[])item.id=decode(item.id);
-   const credential=kind==='register'?await navigator.credentials.create({publicKey:options}):await navigator.credentials.get({publicKey:options});
+   const credential=(kind==='register'||kind==='signup')?await navigator.credentials.create({publicKey:options}):await navigator.credentials.get({publicKey:options});
    if(!credential)throw new Error(button.dataset.cancelled);
    const response={id:credential.id,rawId:encode(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),response:{clientDataJSON:encode(credential.response.clientDataJSON)}};
    if(credential.authenticatorAttachment)response.authenticatorAttachment=credential.authenticatorAttachment;
-   if(kind==='register'){response.response.attestationObject=encode(credential.response.attestationObject);response.response.transports=credential.response.getTransports?.()||[];}
+   if(kind==='register'||kind==='signup'){response.response.attestationObject=encode(credential.response.attestationObject);response.response.transports=credential.response.getTransports?.()||[];}
    else {response.response.authenticatorData=encode(credential.response.authenticatorData);response.response.signature=encode(credential.response.signature);response.response.userHandle=credential.response.userHandle?encode(credential.response.userHandle):null;}
-   const totp=document.querySelector('input[name="totp"]')?.value,recoveryCode=document.querySelector('input[name="recoveryCode"]')?.value;
-   await post('/passkeys/'+kind+'/verify',{flowId:started.flowId,response,...(totp?{totp}:{}),...(recoveryCode?{recoveryCode}:{})});
-   location.assign(base+'/account');
+   const scope=form||document,totp=scope.querySelector('input[name="totp"]')?.value,recoveryCode=scope.querySelector('input[name="recoveryCode"]')?.value,secondFactorToken=scope.querySelector('input[name="secondFactorToken"]')?.value;
+   const verified=await post(prefix+'/verify',{...(started.flowId?{flowId:started.flowId}:{}),response,...(kind!=='second-factor'&&totp?{totp}:{}),...(kind!=='second-factor'&&recoveryCode?{recoveryCode}:{}),...(kind!=='second-factor'&&secondFactorToken?{secondFactorToken}:{})});
+   if(kind==='second-factor'){if(!form)throw new Error(button.dataset.failed);form.querySelector('input[name="secondFactorToken"]').value=verified.secondFactorToken;status.textContent=button.dataset.confirmed;return;}
+   location.assign(base+(kind==='signup'?'/signup':'/account'));
   }catch(error){status.textContent=error instanceof Error&&[button.dataset.unavailable,button.dataset.failed,button.dataset.cancelled].includes(error.message)?error.message:button.dataset.failed;}finally{button.disabled=false;}
  });
 })();`;

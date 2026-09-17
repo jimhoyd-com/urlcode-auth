@@ -4,13 +4,13 @@ This is an implementation branch, not a claim that every first-release row in th
 
 Implemented and covered by automated tests: durable SQLite accounts; bounded scrypt and hash migration; email/password and numeric email codes; OIDC with explicit linking; Google/Apple adapters; WebAuthn registration, login and step-up; TOTP/recovery; opaque sessions and revocation; role ceilings; registration modes; terms and scoped metadata; email change cooldown/cancellation; deletion grace; exports; key rotation; backup/restore; operator CLI/scaffolding; SES/development senders; safe themes and locale catalogue; admin service operations including dual-approval cases and bounded impersonation. Device recognition supports notices and does not exempt MFA. Optional breach checking is an operator-selected external service.
 
+Resumable verification-first password/passkey signup (including waitlist approval) and opt-in email-mediated factor recovery with a 24-hour cancellation window and recovery-session-only reenrollment are implemented.
+
 Mandatory verification/TOTP enrollment, operator standard/hardened presets and explicit pinned configuration migration are implemented; hardened requires email and breach-screening adapters.
 
 ## Remaining first-release acceptance
 
 - Passkey as an alternative second factor, and revocable trusted-device MFA exemptions. Current passkey primary/step-up and device notices are distinct features.
-- Email-mediated lost-second-factor recovery with notice, cooldown, cancellation and restricted reenrollment.
-- Resumable verification-first signup before required credentials are stored, then credential/profile/consent/finalization stages.
 - Localized email copy and browser/accessibility checks. Current UI semantic hooks support escaped operator catalogues; no complete non-English packs are bundled.
 - Disposable-address policy data, progressive abuse backoff and deployment-level IP velocity controls.
 - Admin-side manual recovery queue integration, tracked with the admin spike. Public self-service lost-everything intake is explicitly later in the auth scope table; administrative approval is not automated identity proofing.

@@ -1,3 +1,4 @@
+import { DatabaseSync } from 'node:sqlite';
 import type { TestContext } from 'node:test';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -772,5 +773,158 @@ test('session limits and operator deployment tags require explicit configuration
     }
     finally {
         await Promise.all(opened.map(instance => instance.close()));
+    }
+});
+test('verified-first signup persists browser-bound steps and never hashes credentials before mailbox proof', async (t) => {
+    let checked = 0;
+    const { service, options, database, advance } = await setup(t, { requireEmailVerification: true, checkPassword: async () => { checked++; } });
+    const browserHash = 'a'.repeat(64), begin = await service.beginSignup({ email: 'wizard@example.com', browserHash });
+    const binding = { flowId: begin.flowId, browserHash };
+    assert.equal(begin.step, 'verify-email');
+    assert.equal(begin.delivery?.kind, 'signup-code');
+    assert.equal((await service.listUsers({})).users.length, 0);
+    await assert.rejects(service.setSignupPassword({ ...binding, password }), { code: 'invalid_signup_flow' });
+    await assert.rejects(service.setSignupPasskeyChallenge({ ...binding, challenge: 'x'.repeat(43) }), { code: 'invalid_signup_flow' });
+    assert.equal(checked, 0);
+    assert.equal(await service.getSignup({ ...binding, browserHash: 'b'.repeat(64) }), null);
+    await assert.rejects(service.verifySignup({ ...binding, browserHash: 'b'.repeat(64), code: begin.delivery!.kind === 'signup-code' ? begin.delivery!.code : '' }), { code: 'invalid_signup_code' });
+    const code = begin.delivery!.kind === 'signup-code' ? begin.delivery!.code : '';
+    assert.equal((await service.verifySignup({ ...binding, code })).step, 'credential');
+    await assert.rejects(service.verifySignup({ ...binding, code }), { code: 'invalid_signup_code' });
+    await service.close();
+    const resumed = await createAuthService(options);
+    try {
+        assert.equal((await resumed.getSignup(binding))?.step, 'credential');
+        assert.equal((await resumed.setSignupPassword({ ...binding, password })).step, 'profile');
+        assert.equal(checked, 1);
+        await assert.rejects(resumed.setSignupPassword({ ...binding, password }), { code: 'invalid_signup_flow' });
+        const result = await resumed.completeSignup(binding);
+        assert.ok(result);
+        assert.equal(result.user.id, begin.accountId);
+        assert.equal(result.user.emailVerified, true);
+        assert.equal((await resumed.authenticate(result.token))?.id, begin.accountId);
+        await assert.rejects(resumed.completeSignup(binding), { code: 'invalid_signup_flow' });
+        const db = new DatabaseSync(database, { readOnly: true });
+        try {
+            assert.equal(db.prepare('SELECT count(*) AS n FROM auth_signups').get()?.n, 0);
+        }
+        finally {
+            db.close();
+        }
+        const expiring = await resumed.beginSignup({ email: 'expiry-signup@example.com', browserHash });
+        advance(1800001);
+        assert.equal(await resumed.getSignup({ flowId: expiring.flowId, browserHash }), null);
+    }
+    finally {
+        await resumed.close();
+    }
+});
+test('signup code failures persist a five-attempt ceiling and identifier responses stay uniform', async (t) => {
+    const { service, advance } = await setup(t, { requireEmailVerification: true, blockedEmails: ['blocked-signup@example.com'] });
+    const browserHash = 'c'.repeat(64);
+    const prior = await service.register({ email: 'existing-signup@example.com', password });
+    const existing = await service.beginSignup({ email: prior.user.email, browserHash });
+    const blocked = await service.beginSignup({ email: 'blocked-signup@example.com', browserHash });
+    const start = await service.beginSignup({ email: 'new-signup@example.com', browserHash });
+    assert.equal(existing.step, start.step);
+    assert.equal(blocked.step, start.step);
+    assert.equal(existing.delivery?.kind, 'registration-attempt');
+    assert.equal(blocked.delivery, undefined);
+    const binding = { flowId: start.flowId, browserHash }, code = start.delivery!.kind === 'signup-code' ? start.delivery!.code : '';
+    const wrong = code === '000000' ? '111111' : '000000';
+    for (let n = 0; n < 5; n++)
+        await assert.rejects(service.verifySignup({ ...binding, code: wrong }), { code: 'invalid_signup_code' });
+    await assert.rejects(service.verifySignup({ ...binding, code }), { code: 'invalid_signup_code' });
+    for (let n = 0; n < 9; n++)
+        await service.beginSignup({ email: 'new-signup@example.com', browserHash });
+    await assert.rejects(service.beginSignup({ email: 'new-signup@example.com', browserHash }), { code: 'authentication_rate_limited' });
+    advance(900001);
+    const expired = await service.beginSignup({ email: 'code-expiry@example.com', browserHash });
+    advance(600001);
+    await assert.rejects(service.verifySignup({ flowId: expired.flowId, browserHash, code: expired.delivery!.kind === 'signup-code' ? expired.delivery!.code : '' }), { code: 'invalid_signup_code' });
+    assert.ok(await service.authenticate(prior.token));
+});
+test('signup completion validates profile consent, creates passkey atomically and refuses stale challenges or duplicate races', async (t) => {
+    const { createRegistrationPolicy } = await import('../src/registration.ts');
+    const { service } = await setup(t, { registrationPolicy: createRegistrationPolicy({ termsVersion: 'v1' }) });
+    const browserHash = 'd'.repeat(64), begin = await service.beginSignup({ email: 'passkey-signup@example.com', browserHash }), binding = { flowId: begin.flowId, browserHash };
+    assert.equal(begin.step, 'credential');
+    const challenge = 'a'.repeat(43), credential = { id: 'signup-credential', publicKey: 'synthetic-public-key', counter: 0 };
+    await service.setSignupPasskeyChallenge({ ...binding, challenge });
+    assert.equal((await service.getSignupPasskeyChallenge(binding)).state.accountId, begin.accountId);
+    await assert.rejects(service.setSignupPasskey({ ...binding, challenge: 'b'.repeat(43), credential }), { code: 'invalid_signup_flow' });
+    await service.setSignupPasskey({ ...binding, challenge, credential });
+    await assert.rejects(service.completeSignup(binding));
+    assert.equal(await service.getPasskey(credential.id), null);
+    const registered = await service.completeSignup({ ...binding, profile: { termsAccepted: true } });
+    assert.equal(registered?.user.id, begin.accountId);
+    assert.equal((await service.getPasskey(credential.id))?.accountId, begin.accountId);
+    const first = await service.beginSignup({ email: 'race-signup@example.com', browserHash }), second = await service.beginSignup({ email: 'race-signup@example.com', browserHash });
+    await service.setSignupPassword({ flowId: first.flowId, browserHash, password });
+    await service.setSignupPassword({ flowId: second.flowId, browserHash, password: 'different synthetic password123' });
+    const outcomes = await Promise.all([first, second].map(flow => service.completeSignup({ flowId: flow.flowId, browserHash, profile: { termsAccepted: true } })));
+    assert.equal(outcomes.filter(Boolean).length, 1);
+    assert.equal(outcomes.filter(value => value === null).length, 1);
+    const duplicate = await service.beginSignup({ email: registered!.user.email, browserHash });
+    await service.setSignupPassword({ flowId: duplicate.flowId, browserHash, password });
+    assert.equal(await service.completeSignup({ flowId: duplicate.flowId, browserHash, profile: { termsAccepted: true } }), null);
+    assert.equal((await service.getPasskey(credential.id))?.accountId, begin.accountId);
+});
+test('signup invitation is email-bound and consumed only by successful atomic finalization', async (t) => {
+    const { service } = await setup(t, { registrationMode: 'invite-only' });
+    const admin = await service.bootstrapAdmin({ email: 'signup-invite-admin@example.com', password });
+    const { token: invitationToken } = await service.invite({ actorToken: admin.token, email: 'signup-invited@example.com' });
+    const browserHash = 'e'.repeat(64);
+    const wrong = await service.beginSignup({ email: 'signup-wrong@example.com', browserHash, invitationToken });
+    await service.setSignupPassword({ flowId: wrong.flowId, browserHash, password });
+    assert.equal(await service.completeSignup({ flowId: wrong.flowId, browserHash }), null);
+    const start = await service.beginSignup({ email: 'signup-invited@example.com', browserHash, invitationToken });
+    await service.setSignupPassword({ flowId: start.flowId, browserHash, password });
+    assert.equal((await service.completeSignup({ flowId: start.flowId, browserHash }))?.user.email, 'signup-invited@example.com');
+    await assert.rejects(service.register({ email: 'signup-invited@example.com', password, invitationToken }), { code: 'registration_unavailable' });
+});
+test('verified signup waitlist preserves mailbox proof and pending passkey until atomic approval', async (t) => {
+    const { service } = await setup(t, { registrationMode: 'waitlist', requireEmailVerification: true });
+    const admin = await service.bootstrapAdmin({ email: 'waitlist-proof-admin@example.com', password });
+    const verification = (await service.issueToken({ email: admin.user.email, purpose: 'verify-email' })).token!;
+    await service.consumeVerification(verification);
+    const signed = await service.login({ email: admin.user.email, password });
+    const browserHash = 'f'.repeat(64), start = await service.beginSignup({ email: 'verified-waitlist@example.com', browserHash }), binding = { flowId: start.flowId, browserHash };
+    const code = start.delivery!.kind === 'signup-code' ? start.delivery!.code : '';
+    await service.verifySignup({ ...binding, code });
+    const challenge = 'q'.repeat(43), credential = { id: 'waitlist-passkey', publicKey: 'synthetic-public', counter: 0 };
+    await service.setSignupPasskeyChallenge({ ...binding, challenge });
+    await service.setSignupPasskey({ ...binding, challenge, credential });
+    assert.equal(await service.completeSignup(binding), null);
+    assert.equal(await service.getUser(start.accountId), null);
+    assert.equal(await service.getPasskey(credential.id), null);
+    assert.equal((await service.listRegistrationRequests()).requests[0]?.id, start.accountId);
+    const approved = await service.approveRegistration({ actorToken: signed.token, requestId: start.accountId });
+    assert.equal(approved.emailVerified, true);
+    assert.equal((await service.getPasskey(credential.id))?.accountId, approved.id);
+    assert.equal((await service.listSessions(approved.id)).length, 0);
+});
+test('signup flows are bounded-cleaned and revoked by explicit configuration migration', async (t) => {
+    const { service, options, advance, database } = await setup(t);
+    const browserHash = '1'.repeat(64), expiring = await service.beginSignup({ email: 'cleanup-signup@example.com', browserHash });
+    advance(1800001);
+    await service.cleanup({ limit: 100 });
+    const db = new DatabaseSync(database, { readOnly: true });
+    try {
+        assert.equal(db.prepare('SELECT count(*) AS n FROM auth_signups').get()?.n, 0);
+    }
+    finally {
+        db.close();
+    }
+    assert.equal(await service.getSignup({ flowId: expiring.flowId, browserHash }), null);
+    const active = await service.beginSignup({ email: 'migration-signup@example.com', browserHash });
+    const revised = await createAuthService({ ...options, requireEmailVerification: true, approveConfigurationChangeFrom: await service.getConfigurationRevision() });
+    try {
+        assert.equal(await revised.getSignup({ flowId: active.flowId, browserHash }), null);
+        const event = (await revised.listAudit({ action: 'configuration.changed' })).events[0]!;
+        assert.equal(JSON.parse(event.reason).revoked.auth_signups, 1);
+    }
+    finally {
+        await revised.close();
     }
 });

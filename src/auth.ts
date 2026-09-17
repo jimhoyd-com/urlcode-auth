@@ -1,8 +1,11 @@
+import {createFactorRecoveryFlows} from './factor-recovery.ts';
+import type {FactorRecoveryMessage} from './factor-recovery.ts';
 import { createPresentation } from './presentation.ts';
 import type { PresentationContext } from './presentation.ts';
 import type { RegistrationInput, MetadataValue } from './registration.ts';
 import { isHoneypotFilled } from './registration.ts';
 import type { Presentation } from './presentation.ts';
+import { createSignup } from './auth-signup.ts';
 import { createAuthFlows } from './auth-flows.ts';
 import type { OidcProvider } from './oidc.ts';
 import type { PasskeyProvider } from './passkeys.ts';
@@ -11,12 +14,14 @@ import type { AuthService, AuthPrincipal, AuthUser } from './auth-core.ts';
 import { AuthHttp, AuthHttpError, csrfField, escapeHtml, formField as baseField, httpFailure, jsonResponse, pageResponse as renderPage, readFields, wantsJson, passkeyScript } from './auth-ui.ts';
 import type { AuthHttpResponse } from './auth-ui.ts';
 export interface AuthExtensionOptions {
+    sendFactorRecovery?:(message:FactorRecoveryMessage)=>Promise<void>;
     presentation?: Presentation;
     service: AuthService;
     csrfKey: Uint8Array;
     projectSha256: string;
     providers?: Record<string, OidcProvider>;
     passkeys?: PasskeyProvider;
+    sendSignupCode?: (message: { email: string; code: string; signal: AbortSignal }) => Promise<void>;
     sendEmailCode?: (message: {
         email: string;
         flowId: string;
@@ -25,7 +30,7 @@ export interface AuthExtensionOptions {
     }) => Promise<void>;
     sendNotice?: (message: {
         email: string;
-        event: 'password-changed' | 'new-device';
+        event: 'password-changed' | 'new-device' | 'registration-attempt';
         signal: AbortSignal;
     }) => Promise<void>;
     sendToken?: (message: {
@@ -83,6 +88,8 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                         await notice(result.user.email, 'new-device');
                     return http.device(request).headers;
                 }, enrollment: { required: !!registrationSchema.termsVersion || metadataFields.some(([, field]) => field.required), fields: (presentation) => profileMarkup((name, label, ...rest) => baseField(name, presentation?.textSource(label) ?? label, ...rest), presentation), read: profileInput, names: ['displayName', 'locale', 'termsAccepted', ...metadataFields.map(([name]) => 'meta.' + name)] } }, http, mount, registration);
+            const factorRecovery=createFactorRecoveryFlows(options,http,mount);
+            const signup = createSignup(options, http, mount, { fields: p => profileMarkup((name,label,...rest)=>baseField(name,p.textSource(label),...rest),p), read: profileInput, names: ['displayName','locale','termsAccepted',...metadataFields.map(([name])=>'meta.'+name)] });
             const passkeyButton = (kind: 'register' | 'login' | 'step-up', text: (value: string) => string = value => value) => options.passkeys ? `<button type="button" data-passkey="${kind}" data-base="${escapeHtml(mount)}" data-unavailable="${escapeHtml(text('Passkeys are unavailable in this browser. Use another sign-in method.'))}" data-failed="${escapeHtml(text('Passkey request failed'))}" data-cancelled="${escapeHtml(text('Passkey ceremony cancelled'))}">${escapeHtml(text(kind === 'register' ? 'Add a passkey' : kind === 'step-up' ? 'Confirm identity with a passkey' : 'Sign in with a passkey'))}</button><p role="status" aria-live="polite" data-passkey-status></p>` : '';
             async function principal(request: ExtensionRequest): Promise<{
                 token: string;
@@ -181,6 +188,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                     const factors = () => formField('totp', 'Authenticator code (if enabled)', 'text', 'one-time-code', false) + formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false);
                     try {
                         const path = request.path.slice(mount.length) || '/';
+                        const recovered=await factorRecovery.handle(request,presentation);if(recovered)return recovered;
                         const sessionToken = http.session(request), sessionPrincipal = sessionToken ? await service.authenticate(sessionToken) : null;
                         if (sessionPrincipal && enrollmentRequired(sessionPrincipal)) {
                             const enrollmentPaths = new Set(['/account', '/csrf', '/logout', '/verify', '/send-verification', '/totp/begin', '/totp/confirm', '/login', '/identify', '/step-up', '/assets/passkeys.js', '/email-code', '/send-email-code', '/providers/complete']);
@@ -193,6 +201,17 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             if (sessionPrincipal.restrictions?.includes('verify-email') && (path === '/totp/begin' || path === '/totp/confirm'))
                                 throw new AuthHttpError(403, 'Verify your email before enrolling an authenticator');
                         }
+                        if (path === '/register' && request.method !== 'POST' && ['open','invite-only','waitlist'].includes(registrationMode)) {
+                            const query = new URLSearchParams();
+                            if (request.query.get('lang')) query.set('lang', request.query.get('lang')!);
+                            const invitations=request.query.getAll('token');
+                            if(invitations.length>1 || (invitations[0] && !/^[A-Za-z0-9_-]{43}$/.test(invitations[0]))) throw new AuthHttpError(400,'Invalid invitation');
+                            if(registrationMode==='invite-only' && invitations[0]) query.set('token',invitations[0]);
+                            return redirect(mount + '/signup' + (query.size ? '?' + query : ''));
+                        }
+                        if (path === '/register' && request.method === 'POST' && service.getSecurityPolicy().requireEmailVerification) throw new AuthHttpError(403, 'Complete verified signup first');
+                        const signupResult = await signup(request, presentation);
+                        if (signupResult) return signupResult;
                         const flowResult = await flows.handle(request);
                         if (flowResult)
                             return flowResult;
@@ -205,7 +224,7 @@ export function authExtension(options: AuthExtensionOptions): RuntimeExtension {
                             if (path === '/csrf')
                                 return jsonResponse(200, { csrf }, headers);
                             if (path === '/' || path === '/login')
-                                return pageResponse('Sign in', form(mount + '/identify', csrf, formField('email', 'Email address', 'email', 'username'), 'Continue') + passkeyButton('login', text) + flows.buttons(csrf, false, text, presentation.locale, presentation) + `<nav>${registrationMode !== 'off' ? `<a href="${escapeHtml(mount + '/register')}">${tr("action.register")}</a>` : ''}${options.sendToken ? ` <a href="${escapeHtml(mount + '/forgot-password')}">${tr("nav.forgotPassword")}</a>` : ''}${options.sendEmailCode ? ` <a href="${escapeHtml(mount + '/email-code')}">${tr("copy.emailSignIn")}</a>` : ''}</nav>`, 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
+                                return pageResponse('Sign in', form(mount + '/identify', csrf, formField('email', 'Email address', 'email', 'username'), 'Continue') + passkeyButton('login', text) + flows.buttons(csrf, false, text, presentation.locale, presentation) + `<nav>${registrationMode !== 'off' ? `<a href="${escapeHtml(mount + '/register')}">${tr("action.register")}</a>` : ''}${factorRecovery.enabled()?` <a href="${escapeHtml(mount+'/recover-factor')}">${tr("recovery.lost")}</a>`:''}${options.sendToken ? ` <a href="${escapeHtml(mount + '/forgot-password')}">${tr("nav.forgotPassword")}</a>` : ''}${options.sendEmailCode ? ` <a href="${escapeHtml(mount + '/email-code')}">${tr("copy.emailSignIn")}</a>` : ''}</nav>`, 200, headers, options.passkeys ? mount + '/assets/passkeys.js' : undefined);
                             if (path === '/register') {
                                 const invitations = request.query.getAll('token');
                                 if (invitations.length > 1 || invitations.some(token => token.length > 512))
