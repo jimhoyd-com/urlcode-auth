@@ -52,18 +52,25 @@ async function snapshot(sourceInput: string, destinationInput: string, projectRo
         const active = worker;
         await new Promise<void>((accept, reject) => {
             let done = false;
-            const finish = (error?: Error) => { if (done)
-                return; done = true; clearTimeout(timer); if (error)
-                reject(error);
-            else
-                accept(); };
+            const finish = (error?: Error) => {
+                if (done)
+                    return;
+                done = true;
+                clearTimeout(timer);
+                if (error)
+                    reject(error);
+                else
+                    accept();
+            };
             const timer = setTimeout(() => { void active.terminate(); finish(new Error('Backup exceeded time limit')); }, 30000);
             active.once('message', (message: {
                 ok?: boolean;
             }) => finish(message.ok ? undefined : new Error('Database backup validation failed')));
             active.once('error', () => finish(new Error('Database backup failed')));
-            active.once('exit', code => { if (!done)
-                finish(new Error(`Database backup worker exited (${code})`)); });
+            active.once('exit', code => {
+                if (!done)
+                    finish(new Error(`Database backup worker exited (${code})`));
+            });
         });
         await active.terminate();
         worker = undefined;

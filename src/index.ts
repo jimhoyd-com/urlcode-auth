@@ -8,7 +8,7 @@ export type { OidcProvider, OidcFlow, OidcIdentity, OidcProviderOptions } from '
 export { createPasskeyProvider } from './passkeys.ts';
 export type { PasskeyProvider, StoredPasskey, PasskeyProviderOptions } from './passkeys.ts';
 export { createSesSender, createDevelopmentSender } from './senders.ts';
-export { createPresentation } from './presentation.ts';
+export { createPresentation, englishCatalogue } from './presentation.ts';
 export type { Presentation, PresentationOptions, PresentationContext, Catalogue } from './presentation.ts';
 export * from './registration.ts';
 export { createGoogleProvider, createAppleProvider } from './providers.ts';

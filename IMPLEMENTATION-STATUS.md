@@ -4,13 +4,16 @@ This is an implementation branch, not a claim that every first-release row in th
 
 Implemented and covered by automated tests: durable SQLite accounts; bounded scrypt and hash migration; email/password and numeric email codes; OIDC with explicit linking; Google/Apple adapters; WebAuthn registration, login and step-up; TOTP/recovery; opaque sessions and revocation; role ceilings; registration modes; terms and scoped metadata; email change cooldown/cancellation; deletion grace; exports; key rotation; backup/restore; operator CLI/scaffolding; SES/development senders; safe themes and locale catalogue; admin service operations including dual-approval cases and bounded impersonation. Device recognition supports notices and does not exempt MFA. Optional breach checking is an operator-selected external service.
 
+Mandatory verification/TOTP enrollment, operator standard/hardened presets and explicit pinned configuration migration are implemented; hardened requires email and breach-screening adapters.
+
 ## Remaining first-release acceptance
 
-- Explicit operator migration of pinned auth configuration (URLCode issue #65). Mandatory verification/TOTP enrollment and operator standard/hardened preset factories are implemented; hardened requires email and breach-screening adapters.
-- Trusted-device MFA exemptions and their revocation model, if retained after security review; current device recognition only supports notices.
-- Multi-step registration UX, complete translated copy/error/provider/notice coverage, and browser/accessibility checks.
+- Passkey as an alternative second factor, and revocable trusted-device MFA exemptions. Current passkey primary/step-up and device notices are distinct features.
+- Email-mediated lost-second-factor recovery with notice, cooldown, cancellation and restricted reenrollment.
+- Resumable verification-first signup before required credentials are stored, then credential/profile/consent/finalization stages.
+- Localized email copy and browser/accessibility checks. Current UI semantic hooks support escaped operator catalogues; no complete non-English packs are bundled.
 - Disposable-address policy data, progressive abuse backoff and deployment-level IP velocity controls.
-- Full lost-everything recovery intake/evidence/contact workflow. Administrative factor-reset cases are not identity-proofing automation.
+- Admin-side manual recovery queue integration, tracked with the admin spike. Public self-service lost-everything intake is explicitly later in the auth scope table; administrative approval is not automated identity proofing.
 - Deployment compliance checks, lifecycle delivery/retry contracts and operational monitoring beyond local doctor/cleanup/backup commands.
 - Full cross-package packed-install and CI evidence for the final commit, plus independent security and deployment/recovery assessment.
 

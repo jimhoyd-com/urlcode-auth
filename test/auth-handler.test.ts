@@ -20,8 +20,11 @@ test('email change sends old-address cancellation first and rolls back on failed
         purpose: string;
         token: string;
     }[] = [];
-    const instance = await authExtension({ service, csrfKey, projectSha256, sendToken: async (message) => { delivered.push(message); if (fail)
-            throw new Error('synthetic sender failure'); } }).activate({ registration: 'open' }, { origin, target: 'node', projectSha256, mounts: ['/account'] });
+    const instance = await authExtension({ service, csrfKey, projectSha256, sendToken: async (message) => {
+            delivered.push(message);
+            if (fail)
+                throw new Error('synthetic sender failure');
+        } }).activate({ registration: 'open' }, { origin, target: 'node', projectSha256, mounts: ['/account'] });
     async function post(path: string, data: Record<string, string>) { return instance.handle({ method: 'POST', target: '/account' + path, path: '/account' + path, query: new URLSearchParams(), headers: new Headers({ cookie: '__Host-urlcode-session=' + user.token, origin, 'content-type': 'application/json', accept: 'application/json' }), headerCounts: { cookie: 1, origin: 1 }, body: new TextEncoder().encode(JSON.stringify({ ...data, csrf: http.token(user.token) })), origin, route: '/account/*', mount: '/account', client: null }); }
     assert.equal((await post('/change-email', { email: 'new@example.test', password: 'correct horse battery staple' })).status, 503);
     assert.equal(delivered.length, 1);
@@ -47,16 +50,20 @@ test('new-device notices follow a stable HttpOnly device cookie and do not repea
     const csrfKey = randomBytes(32), origin = 'https://example.test', projectSha256 = 'a'.repeat(64), notices: string[] = [];
     const instance = await authExtension({ service, csrfKey, projectSha256, sendNotice: async (message) => { notices.push(message.event); } }).activate({ registration: 'open' }, { origin, target: 'node', projectSha256, mounts: ['/account'] });
     const cookies = new Map<string, string>();
-    async function call(path: string, data?: Record<string, string>) { const response = await instance.handle({ method: data ? 'POST' : 'GET', target: '/account' + path, path: '/account' + path, query: new URLSearchParams(), headers: new Headers({ cookie: [...cookies].map(([key, value]) => key + '=' + value).join('; '), origin, 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'Synthetic test browser' }), headerCounts: { cookie: 1, origin: 1 }, body: new TextEncoder().encode(data ? JSON.stringify(data) : ''), origin, route: '/account/*', mount: '/account', client: null }); for (const [name, value] of response.headers || [])
-        if (name === 'set-cookie') {
-            const [key, content] = value.split(';')[0]!.split('=');
-            if (value.includes('Max-Age=0'))
-                cookies.delete(key!);
-            else
-                cookies.set(key!, content!);
-        } return { response, data: JSON.parse(new TextDecoder().decode(response.body as Uint8Array)) as {
-            csrf: string;
-        } }; }
+    async function call(path: string, data?: Record<string, string>) {
+        const response = await instance.handle({ method: data ? 'POST' : 'GET', target: '/account' + path, path: '/account' + path, query: new URLSearchParams(), headers: new Headers({ cookie: [...cookies].map(([key, value]) => key + '=' + value).join('; '), origin, 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'Synthetic test browser' }), headerCounts: { cookie: 1, origin: 1 }, body: new TextEncoder().encode(data ? JSON.stringify(data) : ''), origin, route: '/account/*', mount: '/account', client: null });
+        for (const [name, value] of response.headers || [])
+            if (name === 'set-cookie') {
+                const [key, content] = value.split(';')[0]!.split('=');
+                if (value.includes('Max-Age=0'))
+                    cookies.delete(key!);
+                else
+                    cookies.set(key!, content!);
+            }
+        return { response, data: JSON.parse(new TextDecoder().decode(response.body as Uint8Array)) as {
+                csrf: string;
+            } };
+    }
     let prepared = await call('/csrf');
     assert.ok(cookies.has('__Host-urlcode-device'));
     const first = await call('/login', { email: 'device@example.test', password: 'correct horse battery staple', csrf: prepared.data.csrf });
@@ -80,19 +87,26 @@ test('pending OIDC sign-in retains its original proof and fails after identity u
     // Force the UI's second-factor continuation while retaining the real service's
     // proof/version checks. The final service state has no factor, reproducing a
     // factor reset between primary proof and final issuance without a clock race.
-    const flowService = new Proxy(service, { get(target, key) { if (key === 'getExternalProof')
-            return async (provider: string, subject: string) => { const result = await target.getExternalProof(provider, subject); return result ? { ...result, user: { ...result.user, totpEnabled: true } } : null; }; return Reflect.get(target, key); } });
+    const flowService = new Proxy(service, { get(target, key) {
+            if (key === 'getExternalProof')
+                return async (provider: string, subject: string) => { const result = await target.getExternalProof(provider, subject); return result ? { ...result, user: { ...result.user, totpEnabled: true } } : null; };
+            return Reflect.get(target, key);
+        } });
     const provider = { async start() { const state = randomBytes(32).toString('base64url'); return { url: 'https://issuer.test/authorize?state=' + state, flow: { state, nonce: state, verifier: state } }; }, async complete() { return { issuer, subject: 'subject', email: user.user.email, emailVerified: true }; } };
     const origin = 'https://example.test', projectSha256 = 'a'.repeat(64), cookies = new Map<string, string>();
     const instance = await authExtension({ service: flowService, csrfKey: randomBytes(32), projectSha256, providers: { example: provider } }).activate({ registration: 'open' }, { origin, target: 'node', projectSha256, mounts: ['/account'] });
-    async function call(path: string, data?: Record<string, string>) { const url = new URL(path, origin), response = await instance.handle({ method: data ? 'POST' : 'GET', target: path, path: url.pathname, query: url.searchParams, headers: new Headers({ cookie: [...cookies].map(([key, value]) => key + '=' + value).join('; '), origin, 'content-type': 'application/json', accept: 'application/json' }), headerCounts: { cookie: 1, origin: 1 }, body: new TextEncoder().encode(data ? JSON.stringify(data) : ''), origin, route: '/account/*', mount: '/account', client: null }); for (const [name, value] of response.headers || [])
-        if (name === 'set-cookie') {
-            const [key, content] = value.split(';')[0]!.split('=');
-            if (value.includes('Max-Age=0'))
-                cookies.delete(key!);
-            else
-                cookies.set(key!, content!);
-        } return response; }
+    async function call(path: string, data?: Record<string, string>) {
+        const url = new URL(path, origin), response = await instance.handle({ method: data ? 'POST' : 'GET', target: path, path: url.pathname, query: url.searchParams, headers: new Headers({ cookie: [...cookies].map(([key, value]) => key + '=' + value).join('; '), origin, 'content-type': 'application/json', accept: 'application/json' }), headerCounts: { cookie: 1, origin: 1 }, body: new TextEncoder().encode(data ? JSON.stringify(data) : ''), origin, route: '/account/*', mount: '/account', client: null });
+        for (const [name, value] of response.headers || [])
+            if (name === 'set-cookie') {
+                const [key, content] = value.split(';')[0]!.split('=');
+                if (value.includes('Max-Age=0'))
+                    cookies.delete(key!);
+                else
+                    cookies.set(key!, content!);
+            }
+        return response;
+    }
     const csrf = JSON.parse(new TextDecoder().decode((await call('/account/csrf')).body as Uint8Array)).csrf as string;
     const started = await call('/account/providers/example/start', { csrf }), state = new URL(started.headers.find(([name]) => name === 'location')![1]).searchParams.get('state');
     const pending = await call('/account/providers/example/callback?state=' + state), html = new TextDecoder().decode(pending.body as Uint8Array);

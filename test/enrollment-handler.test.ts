@@ -26,17 +26,21 @@ test('restricted bootstrap sessions can verify and enroll but cannot access even
     }[] = [];
     const instance = await authExtension({ service, csrfKey, projectSha256, sendToken: async (message) => { delivered.push(message); } }).activate({ registration: 'open' }, { origin, target: 'node', projectSha256, mounts: ['/account'] });
     function request(path: string, data?: Record<string, string>, html = false): ExtensionRequest { return { method: data ? 'POST' : 'GET', target: path, path, query: new URLSearchParams(), headers: new Headers({ cookie: [...cookies].map(([key, value]) => key + '=' + value).join('; '), origin, ...(data ? { 'content-type': 'application/json' } : {}), accept: html ? 'text/html' : 'application/json' }), headerCounts: { cookie: 1, origin: 1 }, body: Buffer.from(data ? JSON.stringify({ ...data, csrf: http.token(cookies.get('__Host-urlcode-session') || cookies.get('__Host-urlcode-flow') || '') }) : ''), origin, route: '/account/*', mount: '/account', client: null }; }
-    async function call(path: string, data?: Record<string, string>) { const result = await instance.handle(request('/account' + path, data)); for (const [name, value] of result.headers)
-        if (name === 'set-cookie') {
-            const [key, content] = value.split(';')[0]!.split('=');
-            if (value.includes('Max-Age=0'))
-                cookies.delete(key!);
-            else {
-                cookies.set(key!, content!);
-                if (key === '__Host-urlcode-session')
-                    token = content!;
+    async function call(path: string, data?: Record<string, string>) {
+        const result = await instance.handle(request('/account' + path, data));
+        for (const [name, value] of result.headers)
+            if (name === 'set-cookie') {
+                const [key, content] = value.split(';')[0]!.split('=');
+                if (value.includes('Max-Age=0'))
+                    cookies.delete(key!);
+                else {
+                    cookies.set(key!, content!);
+                    if (key === '__Host-urlcode-session')
+                        token = content!;
+                }
             }
-        } return result; }
+        return result;
+    }
     assert.equal((await instance.authorize!({}, request('/private')))?.status, 403);
     assert.equal((await instance.authorize!({ permission: '*' }, request('/private')))?.status, 403);
     const redirect = await instance.authorize!({ onDeny: 'sign-in' }, request('/private'));

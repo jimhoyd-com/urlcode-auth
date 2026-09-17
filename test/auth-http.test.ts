@@ -144,14 +144,22 @@ test('OIDC subjects are scoped to verified issuer across operator provider repla
     let issuer = 'https://issuer-one.test', email = 'one@example.test';
     const provider = { async start() { const state = randomBytes(32).toString('base64url'); return { url: 'https://provider.test/authorize?state=' + state, flow: { state, nonce: state, verifier: state } }; }, async complete() { return { issuer, subject: 'same-subject', email, emailVerified: true }; } };
     const { request, cookies } = await app(t, undefined, { example: provider });
-    async function signIn() { const { csrf } = await (await request('/account/csrf')).json() as {
-        csrf: string;
-    }; const started = await request('/account/providers/example/start', { method: 'POST', data: { csrf } }); assert.equal(started.status, 303); const state = new URL(started.headers.get('location')!).searchParams.get('state'); const completed = await request('/account/providers/example/callback?state=' + state); assert.equal(completed.status, 200); return await completed.json() as {
-        user: {
-            id: string;
-            email: string;
+    async function signIn() {
+        const { csrf } = await (await request('/account/csrf')).json() as {
+            csrf: string;
         };
-    }; }
+        const started = await request('/account/providers/example/start', { method: 'POST', data: { csrf } });
+        assert.equal(started.status, 303);
+        const state = new URL(started.headers.get('location')!).searchParams.get('state');
+        const completed = await request('/account/providers/example/callback?state=' + state);
+        assert.equal(completed.status, 200);
+        return await completed.json() as {
+            user: {
+                id: string;
+                email: string;
+            };
+        };
+    }
     const first = await signIn();
     cookies.clear();
     issuer = 'https://issuer-two.test';
@@ -205,9 +213,18 @@ test('OIDC new-account enrollment collects required consent and metadata before 
     const provider = { async start() { const state = randomBytes(32).toString('base64url'); return { url: 'https://provider.test/authorize?state=' + state, flow: { state, nonce: state, verifier: state } }; }, async complete() { return { issuer: 'https://provider.test', subject: 'enrollment-user', email: 'enrollment@example.test', emailVerified: true }; } };
     const policy = createRegistrationPolicy({ termsVersion: 'current', metadata: { team: { type: 'string', scope: 'public', required: true } } });
     const { request, service } = await app(t, undefined, { example: provider }, undefined, undefined, { registrationPolicy: policy });
-    async function enroll() { const { csrf } = await (await request('/account/csrf')).json() as {
-        csrf: string;
-    }; const started = await request('/account/providers/example/start', { method: 'POST', data: { csrf } }); const state = new URL(started.headers.get('location')!).searchParams.get('state'); const callback = await request('/account/providers/example/callback?state=' + state); assert.equal(callback.status, 200); const html = await callback.text(); assert.match(html, /Complete your account/); return { csrf: html.match(/name="csrf" value="([^"]+)"/)![1]!, flowId: html.match(/name="flowId" value="([^"]+)"/)![1]! }; }
+    async function enroll() {
+        const { csrf } = await (await request('/account/csrf')).json() as {
+            csrf: string;
+        };
+        const started = await request('/account/providers/example/start', { method: 'POST', data: { csrf } });
+        const state = new URL(started.headers.get('location')!).searchParams.get('state');
+        const callback = await request('/account/providers/example/callback?state=' + state);
+        assert.equal(callback.status, 200);
+        const html = await callback.text();
+        assert.match(html, /Complete your account/);
+        return { csrf: html.match(/name="csrf" value="([^"]+)"/)![1]!, flowId: html.match(/name="flowId" value="([^"]+)"/)![1]! };
+    }
     const invalid = await enroll();
     assert.equal((await request('/account/providers/enroll', { method: 'POST', data: { ...invalid, 'meta.team': 'support' } })).status, 400);
     assert.equal((await service.listUsers()).users.length, 0);

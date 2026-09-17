@@ -40,10 +40,14 @@ export interface SessionRecord {
     actorVersion?: number;
 }
 export interface StoreOptions {
+    approveConfigurationChangeFrom?: string;
+    configurationTag?: string;
+    configurationChangeAt: number;
     database: string;
     roles: Record<string, string[]>;
     defaultRole: string;
     sessionIdleMs: number;
+    sessionTtlMs: number;
     securityPolicy: {
         requireEmailVerification: boolean;
         requireMfa: boolean;
@@ -112,7 +116,7 @@ export async function openAuthStore(options: StoreOptions): Promise<AuthStore> {
                 accept();
             else {
                 void worker.terminate();
-                reject(new AuthError(503, message.error === 'auth_configuration_changed' ? 'auth_configuration_changed' : 'auth_store_unavailable'));
+                reject(new AuthError(503, ['auth_configuration_changed', 'configuration_approval_mismatch', 'configuration_roles_invalid', 'configuration_admin_required'].includes(message.error ?? '') ? message.error! : 'auth_store_unavailable'));
             }
         });
         worker.once('error', () => { clearTimeout(timer); reject(new AuthError(503, 'auth_store_unavailable')); });
@@ -154,6 +158,8 @@ if (!isMainThread && workerData?.authStore) {
     const options = workerData as StoreOptions;
     let db: DatabaseSync;
     let initializing = true;
+    let dispatchTransaction = false;
+    let configurationRevision = '';
     const roles = options.roles, permissions = (names: string[]): string[] => [...new Set(names.flatMap(name => roles[name] || []))];
     const admin = (names: string[]) => permissions(names).includes('*');
     const error = (status: number, code: string): never => { throw new AuthError(status, code); };
@@ -175,6 +181,8 @@ if (!isMainThread && workerData?.authStore) {
             metric('signup', action === 'account.external_register' ? 'oidc' : action === 'accounts.imported' ? 'unknown' : 'password', now, action === 'accounts.imported' ? Number(subject) : 1);
     };
     const transaction = <T>(fn: () => T): T => {
+        if (dispatchTransaction)
+            return fn();
         db.exec('BEGIN IMMEDIATE');
         try {
             const activeKey = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_meta'").get() ? db.prepare("SELECT value FROM auth_meta WHERE key='activeEncryptionKey'").get()?.value : undefined;
@@ -293,13 +301,56 @@ if (!isMainThread && workerData?.authStore) {
             db.exec('ALTER TABLE auth_waitlist ADD COLUMN profile TEXT;');
         if (!db.prepare('PRAGMA table_info(auth_sessions)').all().some(row => row.name === 'last_seen'))
             db.exec('ALTER TABLE auth_sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;ALTER TABLE auth_sessions ADD COLUMN device_label TEXT;UPDATE auth_sessions SET last_seen=created;');
-        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
-        const previous = db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value;
-        if (previous && previous !== configuration)
-            error(503, 'auth_configuration_changed');
-        if (!previous)
-            db.prepare("INSERT INTO auth_meta VALUES('configuration',?)").run(configuration);
-        transaction(() => {
+        const configuration = createHash('sha256').update(JSON.stringify({ roles: Object.fromEntries(Object.keys(roles).sort().map(name => [name, [...roles[name]!].sort()])), defaultRole: options.defaultRole, registration: options.registration, ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), ...(options.sessionTtlMs !== 86400000 || options.sessionIdleMs !== 1800000 ? { sessionLimits: { absoluteMs: options.sessionTtlMs, idleMs: options.sessionIdleMs } } : {}), ...(options.securityPolicy.requireEmailVerification || options.securityPolicy.requireMfa || options.securityPolicy.deletionGraceMs !== 604800000 ? { securityPolicy: options.securityPolicy } : {}) })).digest('hex');
+        configurationRevision = transaction(() => {
+            const previous = db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value;
+            const currentDefinition = db.prepare("SELECT value FROM auth_meta WHERE key='configurationDefinition'").get()?.value ?? previous;
+            const sameDefinition = Boolean(previous) && currentDefinition === configuration;
+            let nextRevision = String(previous ?? configuration);
+            const approval = options.approveConfigurationChangeFrom;
+            const lastMigration = JSON.parse(String(db.prepare("SELECT value FROM auth_meta WHERE key='configurationMigration'").get()?.value ?? 'null')) as {
+                from: string;
+                to: string;
+            } | null;
+            if (approval && approval !== previous && !(sameDefinition && lastMigration?.from === approval && lastMigration.to === previous))
+                error(503, 'configuration_approval_mismatch');
+            if (previous && !sameDefinition) {
+                nextRevision = createHash('sha256').update('urlcode-auth-configuration-v1\0' + String(previous) + '\0' + configuration).digest('hex');
+                if (approval !== previous)
+                    error(503, 'auth_configuration_changed');
+                const priorAdministrators = num(db.prepare("SELECT count(*) AS n FROM auth_accounts WHERE administrator=1 AND status='active'").get()?.n);
+                let nextAdministrators = 0;
+                for (const row of db.prepare('SELECT data FROM auth_accounts').iterate()) {
+                    const user = JSON.parse(String(row.data)) as AuthRecord;
+                    if (!Array.isArray(user.roles) || user.roles.some(role => !Object.hasOwn(roles, role)) || !Number.isSafeInteger(user.version) || user.version >= Number.MAX_SAFE_INTEGER)
+                        error(503, 'configuration_roles_invalid');
+                    if (user.status === 'active' && admin(user.roles))
+                        nextAdministrators++;
+                }
+                if (priorAdministrators > 0 && nextAdministrators === 0)
+                    error(503, 'configuration_admin_required');
+                const counts: Record<string, number> = {};
+                for (const table of ['auth_sessions', 'auth_tokens', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist'])
+                    counts[table] = num(db.prepare('SELECT count(*) AS n FROM ' + table).get()?.n);
+                const adminRoles = Object.keys(roles).filter(role => roles[role]!.includes('*'));
+                const adminSql = adminRoles.length ? "EXISTS(SELECT 1 FROM json_each(auth_accounts.data,'$.roles') WHERE value IN (" + adminRoles.map(() => '?').join(',') + '))' : '0';
+                db.prepare("UPDATE auth_accounts SET data=json_set(json_remove(data,'$.totpPending','$.totpPendingUntil'),'$.version',json_extract(data,'$.version')+1),administrator=" + adminSql).run(...adminRoles);
+                db.prepare("DELETE FROM auth_tokens WHERE purpose<>'cancel-deletion' OR expires<=? OR NOT EXISTS(SELECT 1 FROM auth_accounts WHERE auth_accounts.id=auth_tokens.account_id AND status='pending-delete')").run(options.configurationChangeAt);
+                db.prepare("UPDATE auth_tokens SET version=(SELECT json_extract(data,'$.version') FROM auth_accounts WHERE id=auth_tokens.account_id) WHERE purpose='cancel-deletion'").run();
+                const cancellationTokens = num(db.prepare('SELECT count(*) AS n FROM auth_tokens').get()?.n);
+                counts.auth_tokens = (counts.auth_tokens ?? 0) - cancellationTokens;
+                for (const table of ['auth_sessions', 'auth_flows', 'auth_email_codes', 'auth_invites', 'auth_email_changes', 'auth_waitlist'])
+                    db.prepare('DELETE FROM ' + table).run();
+                counts.auth_cases = Number(db.prepare("UPDATE auth_cases SET data=json_set(data,'$.status','closed') WHERE json_extract(data,'$.status')='pending'").run().changes);
+                db.prepare("UPDATE auth_meta SET value=? WHERE key='configuration'").run(nextRevision);
+                db.prepare("INSERT INTO auth_meta VALUES('configurationMigration',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify({ from: previous, to: nextRevision }));
+                audit('operator', 'configuration.changed', nextRevision, options.configurationChangeAt, JSON.stringify({ from: previous, revoked: counts, preservedCancellationTokens: cancellationTokens }));
+            }
+            else if (!previous) {
+                if (approval || num(db.prepare('SELECT count(*) AS n FROM auth_accounts').get()?.n) > 0)
+                    error(503, 'configuration_approval_mismatch');
+                db.prepare("INSERT INTO auth_meta VALUES('configuration',?)").run(configuration);
+            }
             const cipherKey = (value: string) => value.includes('.') ? value.split('.')[0]! : 'legacy';
             const required = new Set<string>();
             for (const row of db.prepare('SELECT data FROM auth_accounts').iterate()) {
@@ -327,6 +378,8 @@ if (!isMainThread && workerData?.authStore) {
             usedKeys.add(options.activeKey);
             db.prepare("INSERT INTO auth_meta VALUES('usedEncryptionKeys',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify([...usedKeys]));
             db.prepare("INSERT INTO auth_meta VALUES('activeEncryptionKey',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(options.activeKey);
+            db.prepare("INSERT INTO auth_meta VALUES('configurationDefinition',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(configuration);
+            return nextRevision;
         });
         initializing = false;
         port.postMessage({ ready: true });
@@ -341,9 +394,18 @@ if (!isMainThread && workerData?.authStore) {
         args: Record<string, unknown>;
     }) => {
         try {
+            db.exec('BEGIN IMMEDIATE');
+            dispatchTransaction = true;
+            if (db.prepare("SELECT value FROM auth_meta WHERE key='configuration'").get()?.value !== configurationRevision)
+                error(503, 'stale_auth_configuration');
+            if (db.prepare("SELECT value FROM auth_meta WHERE key='activeEncryptionKey'").get()?.value !== options.activeKey)
+                error(503, 'stale_encryption_key');
             const now = Number(args.now);
             let value: unknown;
             switch (operation) {
+                case 'configurationRevision':
+                    value = configurationRevision;
+                    break;
                 case 'account':
                     value = account(String(args.id));
                     break;
@@ -1278,9 +1340,18 @@ if (!isMainThread && workerData?.authStore) {
                     break;
                 default: error(400, 'unsupported_auth_operation');
             }
+            db.exec('COMMIT');
+            dispatchTransaction = false;
             port.postMessage({ id, value });
         }
         catch (e) {
+            if (dispatchTransaction) {
+                try {
+                    db.exec('ROLLBACK');
+                }
+                catch { /* Closed database remains unavailable. */ }
+                dispatchTransaction = false;
+            }
             port.postMessage({ id, error: { status: e instanceof AuthError ? e.status : 503, code: e instanceof AuthError ? e.code : 'auth_store_unavailable' } });
         }
     });

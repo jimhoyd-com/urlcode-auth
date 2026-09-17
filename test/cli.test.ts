@@ -21,6 +21,9 @@ test('operator CLI bootstraps without exposing session/password and supports bac
         id: string;
     };
     assert.equal(run('bootstrap', { email: 'second@example.com', password }).status, 1);
+    const configuration = run('configuration');
+    assert.equal(configuration.status, 0, configuration.stderr);
+    assert.match(JSON.parse(configuration.stdout).revision, /^[a-f0-9]{64}$/);
     const doctor = run('doctor');
     assert.equal(doctor.status, 0, doctor.stderr);
     assert.equal(JSON.parse(doctor.stdout).accounts, 1);

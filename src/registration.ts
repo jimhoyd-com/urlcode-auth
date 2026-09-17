@@ -42,13 +42,16 @@ export interface RegistrationPolicy {
 }
 const forbidden = new Set(['__proto__', 'prototype', 'constructor', 'role', 'roles', 'permission', 'permissions', 'session', 'sessions', 'sessionid', 'token', 'password', 'passwordhash', 'secret', 'secrets', 'emailverified', 'status', 'administrator', 'id', 'userid', 'accountid', 'authenticatedat', 'totp', 'totpsecret', 'recoverycodes', 'claims', 'auth', 'security']);
 function object(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === 'object' && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)); }
-function locale(value: unknown): string { if (typeof value !== 'string' || value.length > 64 || !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(value))
-    throw new Error('Invalid profile locale'); try {
-    return Intl.getCanonicalLocales(value)[0]!;
+function locale(value: unknown): string {
+    if (typeof value !== 'string' || value.length > 64 || !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(value))
+        throw new Error('Invalid profile locale');
+    try {
+        return Intl.getCanonicalLocales(value)[0]!;
+    }
+    catch {
+        throw new Error('Invalid profile locale');
+    }
 }
-catch {
-    throw new Error('Invalid profile locale');
-} }
 function validValue(value: unknown, field: MetadataField): value is MetadataValue {
     if (typeof value !== field.type)
         return false;

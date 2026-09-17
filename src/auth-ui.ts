@@ -126,12 +126,20 @@ export class AuthHttp {
             string,
             string
         ][];
-    } { const cached = this.#devices.get(request); if (cached)
-        return cached; const existing = this.cookie(request, '__Host-urlcode-device'); const value = { id: existing || randomBytes(32).toString('base64url'), label: (request.headers.get('user-agent') || 'Browser').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160), headers: [] as [
-            string,
-            string
-        ][] }; if (!existing)
-        value.headers.push(['set-cookie', this.setCookie('__Host-urlcode-device', value.id, 31536000)]); this.#devices.set(request, value); return value; }
+    } {
+        const cached = this.#devices.get(request);
+        if (cached)
+            return cached;
+        const existing = this.cookie(request, '__Host-urlcode-device');
+        const value = { id: existing || randomBytes(32).toString('base64url'), label: (request.headers.get('user-agent') || 'Browser').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160), headers: [] as [
+                string,
+                string
+            ][] };
+        if (!existing)
+            value.headers.push(['set-cookie', this.setCookie('__Host-urlcode-device', value.id, 31536000)]);
+        this.#devices.set(request, value);
+        return value;
+    }
     session(request: ExtensionRequest): string | undefined { return this.cookie(request, this.sessionCookie); }
     token(binding: string): string { return createHmac('sha256', this.#key).update('urlcode-csrf\0' + this.origin + '\0' + binding).digest('hex'); }
     prepare(request: ExtensionRequest): {
@@ -171,7 +179,8 @@ export function httpFailure(error: unknown, request: ExtensionRequest, presentat
     const status = known ? (error as Error & {
         status: number;
     }).status : 500;
-    const message = error instanceof AuthHttpError ? error.message : status >= 500 ? 'Service unavailable' : 'Request could not be completed';
+    const source = error instanceof AuthHttpError ? error.message : status >= 500 ? 'Service unavailable' : 'Request could not be completed';
+    const message = presentation?.textSource(source) ?? source;
     return wantsJson(request) ? jsonResponse(status, { error: message }) : pageResponse('Request could not be completed', `<p class="error" role="alert">${escapeHtml(presentation?.textSource(message) ?? message)}</p>`, status, [], undefined, presentation);
 }
 /** Browser glue for maintained server-side WebAuthn verification. No guest scripts. */
@@ -181,14 +190,14 @@ export const passkeyScript = String.raw `(() => {
  for(const button of document.querySelectorAll('[data-passkey]'))button.addEventListener('click',async()=>{
   const status=document.querySelector('[data-passkey-status]');button.disabled=true;
   try{
-   if(!window.PublicKeyCredential||!navigator.credentials)throw new Error('Passkeys are unavailable in this browser. Use another sign-in method.');
+   if(!window.PublicKeyCredential||!navigator.credentials)throw new Error(button.dataset.unavailable);
    const base=button.dataset.base,kind=button.dataset.passkey,csrf=document.querySelector('input[name="csrf"]').value;
-   const post=async(path,data)=>{const response=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:JSON.stringify(data)});const result=await response.json();if(!response.ok)throw new Error(result.error||'Passkey request failed');return result;};
+   const post=async(path,data)=>{const response=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:JSON.stringify(data)});const result=await response.json();if(!response.ok)throw new Error(button.dataset.failed);return result;};
    const started=await post('/passkeys/'+kind+'/options',{}),options=started.options;options.challenge=decode(options.challenge);
    if(options.user)options.user.id=decode(options.user.id);
    for(const item of options.excludeCredentials||options.allowCredentials||[])item.id=decode(item.id);
    const credential=kind==='register'?await navigator.credentials.create({publicKey:options}):await navigator.credentials.get({publicKey:options});
-   if(!credential)throw new Error('Passkey ceremony cancelled');
+   if(!credential)throw new Error(button.dataset.cancelled);
    const response={id:credential.id,rawId:encode(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),response:{clientDataJSON:encode(credential.response.clientDataJSON)}};
    if(credential.authenticatorAttachment)response.authenticatorAttachment=credential.authenticatorAttachment;
    if(kind==='register'){response.response.attestationObject=encode(credential.response.attestationObject);response.response.transports=credential.response.getTransports?.()||[];}
@@ -196,6 +205,6 @@ export const passkeyScript = String.raw `(() => {
    const totp=document.querySelector('input[name="totp"]')?.value,recoveryCode=document.querySelector('input[name="recoveryCode"]')?.value;
    await post('/passkeys/'+kind+'/verify',{flowId:started.flowId,response,...(totp?{totp}:{}),...(recoveryCode?{recoveryCode}:{})});
    location.assign(base+'/account');
-  }catch(error){status.textContent=error instanceof Error?error.message:'Passkey request failed';}finally{button.disabled=false;}
+  }catch(error){status.textContent=error instanceof Error&&[button.dataset.unavailable,button.dataset.failed,button.dataset.cancelled].includes(error.message)?error.message:button.dataset.failed;}finally{button.disabled=false;}
  });
 })();`;

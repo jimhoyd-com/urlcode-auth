@@ -31,7 +31,7 @@ try {
     const { values, positionals } = parseArgs({ allowPositionals: true, options: { 'operator-file': { type: 'string' }, directory: { type: 'string' }, help: { type: 'boolean' } } });
     const command = positionals[0];
     if (values.help || !command)
-        process.stdout.write('urlcode-auth init --directory NEW_DIRECTORY\nurlcode-auth bootstrap|users|sessions|revoke|audit|import|rotate-key|purge|cleanup|doctor --operator-file /absolute/operator/auth.mjs\nurlcode-auth backup|restore (JSON paths on stdin)\nSecrets and operation data use bounded JSON stdin, never argv. Operator module default-exports an AuthService.\n');
+        process.stdout.write('urlcode-auth init --directory NEW_DIRECTORY\nurlcode-auth bootstrap|users|sessions|revoke|audit|import|rotate-key|purge|cleanup|configuration|doctor --operator-file /absolute/operator/auth.mjs\nurlcode-auth backup|restore (JSON paths on stdin)\nSecrets and operation data use bounded JSON stdin, never argv. Operator module default-exports an AuthService.\n');
     else {
         if (positionals.length !== 1)
             throw new Error('Invalid command');
@@ -44,7 +44,7 @@ try {
             output = command === 'backup' ? await createBackup({ database: string(data.database), destination, projectRoot }) : await restoreBackup({ backup: string(data.backup), destination, projectRoot });
         }
         else {
-            if (!['bootstrap', 'users', 'sessions', 'revoke', 'audit', 'import', 'rotate-key', 'purge', 'cleanup', 'doctor'].includes(command))
+            if (!['bootstrap', 'users', 'sessions', 'revoke', 'audit', 'import', 'rotate-key', 'purge', 'cleanup', 'configuration', 'doctor'].includes(command))
                 throw new Error('Invalid command');
             if (!values['operator-file'] || !isAbsolute(values['operator-file']))
                 throw new Error('Provide an absolute operator file');
@@ -69,6 +69,8 @@ try {
                 output = await service.purgeDeleted();
             else if (command === 'cleanup')
                 output = await service.cleanup({ limit: 1000 });
+            else if (command === 'configuration')
+                output = { revision: await service.getConfigurationRevision(), registration: service.getRegistrationMode(), security: service.getSecurityPolicy(), roles: service.getRoles() };
             else if (command === 'doctor')
                 output = { database: 'ready', registration: service.getRegistrationMode(), security: service.getSecurityPolicy(), accounts: (await service.dashboard()).users, liveProviders: 'unverified' };
             else if (command === 'import') {

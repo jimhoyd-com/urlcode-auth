@@ -98,6 +98,8 @@ export interface AuthHookStats {
     timedOut: number;
 }
 export interface AuthOptions {
+    approveConfigurationChangeFrom?: string;
+    configurationTag?: string;
     requireEmailVerification?: boolean;
     requireMfa?: boolean;
     deletionGraceMs?: number;
@@ -408,6 +410,7 @@ export interface AuthService {
         token: string;
         profile: RegistrationInput;
     }): Promise<RegistrationProfile>;
+    getConfigurationRevision(): Promise<string>;
     getSecurityPolicy(): AuthSecurityPolicy;
     getHookStats(): AuthHookStats;
     getRegistrationSchema(): RegistrationOptions;
@@ -604,6 +607,10 @@ async function verifyPassword(value: string, encoded: string | undefined): Promi
 }
 const basePublicUser = (user: AuthRecord): AuthUser => ({ id: user.id, email: user.email, emailVerified: user.emailVerified, status: user.status, roles: [...user.roles], created: user.created, totpEnabled: Boolean(user.totpSecret) });
 export async function createAuthService(options: AuthOptions): Promise<AuthService> {
+    if (options.approveConfigurationChangeFrom !== undefined && (typeof options.approveConfigurationChangeFrom !== 'string' || !/^[a-f0-9]{64}$/.test(options.approveConfigurationChangeFrom)))
+        fail(400, 'invalid_configuration_approval');
+    if (options.configurationTag !== undefined && (typeof options.configurationTag !== 'string' || options.configurationTag.length < 1 || options.configurationTag.length > 128 || /[\x00-\x1f\x7f]/.test(options.configurationTag)))
+        fail(400, 'invalid_configuration_tag');
     for (const value of [options.requireEmailVerification, options.requireMfa])
         if (value !== undefined && typeof value !== 'boolean')
             fail(400, 'invalid_security_policy');
@@ -666,7 +673,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
             fail(503, 'invalid_clock');
         return value;
     };
-    const store = await openAuthStore({ database: options.database, roles, defaultRole, sessionIdleMs: idle, securityPolicy, registration: { mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
+    const store = await openAuthStore({ database: options.database, ...(options.approveConfigurationChangeFrom ? { approveConfigurationChangeFrom: options.approveConfigurationChangeFrom } : {}), configurationChangeAt: now(), ...(options.configurationTag !== undefined ? { configurationTag: options.configurationTag } : {}), roles, defaultRole, sessionTtlMs: ttl, sessionIdleMs: idle, securityPolicy, registration: { mode, allowed, blocked, allowedEmails, blockedEmails, allowImpersonation: options.allowImpersonation === true }, activeKey, keyFingerprints: Object.fromEntries(Object.entries(keys).map(([name, value]) => [name, createHmac('sha256', value).update('urlcode-auth-store-v1').digest('hex')])) });
     let closed = false;
     const hookStats: AuthHookStats = { accepted: 0, dropped: 0, failed: 0, timedOut: 0 };
     const hookControllers = new Set<AbortController>();
@@ -1180,6 +1187,7 @@ export async function createAuthService(options: AuthOptions): Promise<AuthServi
         },
         async getProfile(raw) { const { user } = await lookupSession(raw, true); return profilePolicy.publicProfile(user.profile ?? { metadata: {} }); },
         async updateProfile(input) { const { user } = await lookupSession(input.token, true), profile = validateProfile(input.profile, user.profile); await store.call('updateProfile', { hash: digest(input.token), profile, version: user.version, now: now() }); return profilePolicy.publicProfile(profile); },
+        async getConfigurationRevision() { check(); return store.call<string>('configurationRevision'); },
         getSecurityPolicy: () => ({ ...securityPolicy }),
         getHookStats: () => ({ ...hookStats }),
         getRegistrationSchema: () => profilePolicy.publicSchema(),

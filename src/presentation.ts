@@ -4,6 +4,180 @@ export type PluralMessage = Partial<Record<Intl.LDMLPluralRule, string>> & {
 };
 export type Catalogue = Record<string, string | PluralMessage>;
 export const englishCatalogue: Readonly<Catalogue> = Object.freeze({
+    "notice.emailCodeEligible": "If this account is eligible, a sign-in code will be sent.",
+    "notice.passwordResetEligible": "If this account is eligible, a reset message will be sent.",
+    "notice.verificationEligible": "If this account is eligible, a verification message will be sent.",
+    "action.selectAccount": "Select {account}",
+    "error.httpInvalidRequestEncoding": "Invalid request encoding",
+    "error.httpInvalidJSONBody": "Invalid JSON body",
+    "error.httpExpectedAnObject": "Expected an object",
+    "error.httpUseJSONOrFormData": "Use JSON or form data",
+    "error.httpTooManyFields": "Too many fields",
+    "error.httpInvalidRequestField": "Invalid request field",
+    "error.httpInvalidCookies": "Invalid cookies",
+    "error.httpDuplicateSessionCookie": "Duplicate session cookie",
+    "error.httpInvalidSessionCookie": "Invalid session cookie",
+    "error.httpSameOriginRequestRequired": "Same-origin request required",
+    "error.httpInvalidCSRFToken": "Invalid CSRF token",
+    "error.httpExportExceedsOnePage": "Export exceeds one page",
+    "error.httpDuplicateFilter": "Duplicate filter",
+    "error.httpUseAUTCDateAndTimeEndingInZ": "Use a UTC date and time ending in Z",
+    "error.httpInvalidAuditTime": "Invalid audit time",
+    "error.httpInvalidTimeRange": "Invalid time range",
+    "error.httpInvalidEncoding": "Invalid encoding",
+    "error.httpInvalidJSON": "Invalid JSON",
+    "error.httpInvalidSelection": "Invalid selection",
+    "error.httpUseOneSelectionFormat": "Use one selection format",
+    "error.httpSelectBetweenOneAndFiftyDistinctAccounts": "Select between one and fifty distinct accounts",
+    "message.accountState": "Email: {email}. Authenticator: {authenticator}.",
+    "state.verified": "verified",
+    "state.unverified": "not yet verified",
+    "state.enabled": "enabled",
+    "state.disabled": "not enabled",
+    "message.sessionStarted": "Started {created}; expires {expires}",
+    "message.deletionGrace": "Deletion signs out all sessions immediately. A cancellation link will be emailed, valid for {days} days before permanent removal. Confirm your identity first.",
+    "message.adminTotals": "{users} accounts; {locked} locked; {pending} pending deletion; {sessions} sessions; {waitlist} waiting for approval.",
+    "message.sessionsOnPage": { "one": "{count} session on this page.", "other": "{count} sessions on this page." },
+    "message.bulkUpdated": { "one": "{count} account updated.", "other": "{count} accounts updated." },
+    "message.sessionAccountDetail": "Account {account}; started {created}; expires {expires}",
+    "message.caseSummary": "{action} for {account} \u2014 {status}",
+    "common.yes": "Yes",
+    "common.no": "No",
+    "provider.link": "Link {provider}",
+    "provider.signIn": "Sign in with {provider}",
+    "number.value": "{value}",
+    "error.serviceUnavailable": "Service unavailable",
+    "error.passkeyUnavailable": "Passkeys are unavailable in this browser. Use another sign-in method.",
+    "error.passkeyFailed": "Passkey request failed",
+    "error.passkeyCancelled": "Passkey ceremony cancelled",
+    "field.booleanHint": "true or false",
+    "message.acceptTerms": "I accept terms version {version}",
+    "error.invalidNumericMetadata": "Invalid numeric metadata",
+    "error.invalidBooleanMetadata": "Invalid boolean metadata",
+    "error.emailDeliveryIsNotConfigured": "Email delivery is not configured",
+    "error.verifyYourEmailBeforeEnrollingAnAuthenticator": "Verify your email before enrolling an authenticator",
+    "action.continue": "Continue",
+    "copy.emailSignIn": "Email sign in",
+    "error.invalidInvitation": "Invalid invitation",
+    "error.notFound": "Not found",
+    "copy.leaveEmpty": "Leave empty",
+    "error.invalidEmailFlow": "Invalid email flow",
+    "error.aSingleTokenIsRequired": "A single token is required",
+    "action.confirmOperation": "Confirm",
+    "copy.confirmOnlyAnAccountYouCreatedVerificationConfirmsThisEmailAddressItDoesNotSetOrResetAPassword": "Confirm only an account you created. Verification confirms this email address; it does not set or reset a password.",
+    "page.completeAccountEnrollment": "Complete account enrollment",
+    "copy.applicationAccessRemainsBlockedUntilAllRequiredEnrollmentStepsAreComplete": "Application access remains blocked until all required enrollment steps are complete.",
+    "copy.verifyYourEmailFirst": "Verify your email first",
+    "copy.emailDeliveryIsUnavailableContactTheSiteOperator": "Email delivery is unavailable. Contact the site operator.",
+    "copy.enrollAnAuthenticator": "Enroll an authenticator",
+    "copy.ifYourRecentSignInHasExpired": "if your recent sign-in has expired.",
+    "copy.youAreViewingThisAccountAsASupportAdministratorAccountSecurityChangesAreDisabledEndImpersonationToSignInAsYour": "You are viewing this account as a support administrator. Account security changes are disabled. End impersonation to sign in as yourself.",
+    "action.requestEmailChange24HourCoolingPeriod": "Request email change (24-hour cooling period)",
+    "action.revokeThisSession": "Revoke this session",
+    "page.signInMethods": "Sign-in methods",
+    "copy.passkeys": "Passkeys",
+    "action.removePasskey": "Remove passkey",
+    "copy.linkedProviders": "Linked providers",
+    "action.unlinkProvider": "Unlink provider",
+    "copy.theLastSignInMethodCannotBeRemoved": "The last sign-in method cannot be removed.",
+    "error.enterAnEmailAddress": "Enter an email address",
+    "error.securityChangesAreDisabledDuringImpersonation": "Security changes are disabled during impersonation",
+    "error.emailDeliveryRequired": "Email delivery required",
+    "error.emailDeliveryFailedChangeCancelled": "Email delivery failed; change cancelled",
+    "error.emailDeliveryIsRequiredForDeletionRecovery": "Email delivery is required for deletion recovery",
+    "error.deletionConfirmationRequired": "Deletion confirmation required",
+    "copy.addThisKeyToYourAuthenticator": "Add this key to your authenticator:",
+    "copy.storeTheseCodesSecurelyEachCanBeUsedOnce": "Store these codes securely. Each can be used once.",
+    "copy.continueToYourAccount": "Continue to your account",
+    "error.invalidAuthenticationFlow": "Invalid authentication flow",
+    "error.authenticationFlowBelongsToAnotherBrowser": "Authentication flow belongs to another browser",
+    "error.requestBodyTooLarge": "Request body too large",
+    "error.jSONRequired": "JSON required",
+    "error.invalidAuthenticationPayload": "Invalid authentication payload",
+    "error.confirmYourIdentityFirst": "Confirm your identity first",
+    "error.pOSTRequired": "POST required",
+    "error.invalidProviderResponse": "Invalid provider response",
+    "error.gETOrPOSTRequired": "GET or POST required",
+    "error.formCallbackRequired": "Form callback required",
+    "error.invalidProviderState": "Invalid provider state",
+    "error.providerFlowMismatch": "Provider flow mismatch",
+    "error.invalidIdentityIssuer": "Invalid identity issuer",
+    "error.anExistingLinkedAccountIsRequired": "An existing linked account is required",
+    "page.completeYourAccount": "Complete your account",
+    "error.identityChangedDuringSignIn": "Identity changed during sign in",
+    "error.invalidEnrollment": "Invalid enrollment",
+    "error.identityChangedDuringEnrollment": "Identity changed during enrollment",
+    "error.unknownAuthenticationField": "Unknown authentication field",
+    "error.browserFlowRequired": "Browser flow required",
+    "error.flowIDRequired": "Flow ID required",
+    "error.invalidChallenge": "Invalid challenge",
+    "error.invalidCredential": "Invalid credential",
+    "error.accountChangedDuringCeremony": "Account changed during ceremony",
+    "error.passkeyAuthenticationFailed": "Passkey authentication failed",
+    "error.passkeyBelongsToAnotherAccount": "Passkey belongs to another account",
+    "error.invalidSecondFactor": "Invalid second factor",
+    "action.startTenMinuteSupportImpersonation": "Start ten-minute support impersonation",
+    "copy.selectASectionOnlyPermittedOperationsAreShownConfigurationRemainsInVersionControlledProjectFiles": "Select a section. Only permitted operations are shown. Configuration remains in version-controlled project files.",
+    "copy.authenticationActivityLast30UTCDays": "Authentication activity: last 30 UTC days",
+    "copy.recordedAccountCreationsSuccessfulSignInsAndFailedSignInsTheseFiguresDescribeAuthenticationActivityDeploymentH": "Recorded account creations, successful sign-ins and failed sign-ins. These figures describe authentication activity; deployment health is not measured here.",
+    "copy.dailyAuthenticationCounts": "Daily authentication counts",
+    "copy.uTCDay": "UTC day",
+    "copy.signUps": "Sign-ups",
+    "copy.signIns": "Sign-ins",
+    "copy.failedSignIns": "Failed sign-ins",
+    "copy.authenticationMethodsOverTheSame30Days": "Authentication methods over the same 30 days",
+    "copy.method": "Method",
+    "copy.recentEvents": "Recent events",
+    "page.supportCases": "Support cases",
+    "action.closeWithoutApplying": "Close without applying",
+    "action.approveAndApply": "Approve and apply",
+    "action.createCaseForASecondAdministrator": "Create case for a second administrator",
+    "action.approveAccount": "Approve account",
+    "action.sendInvitation": "Send invitation",
+    "error.accountNotFound": "Account not found",
+    "page.accountDetails": "Account details",
+    "copy.email": "Email",
+    "copy.status": "Status",
+    "copy.emailVerified": "Email verified",
+    "copy.authenticatorEnabled": "Authenticator enabled",
+    "copy.created": "Created",
+    "copy.language": "Language",
+    "copy.termsVersion": "Terms version",
+    "copy.recentAccountActivity": "Recent account activity",
+    "copy.viewAccountAudit": "View account audit",
+    "action.createAccountAndSendSetupLink": "Create account and send setup link",
+    "copy.filterUsers": "Filter users",
+    "action.exportThisPageAsCSV": "Export this page as CSV",
+    "copy.exportThisFilteredPageOnlyAtMost50AccountsEmailAddressesStayMasked": "Export this filtered page only, at most 50 accounts. Email addresses stay masked.",
+    "copy.bulkAction": "Bulk action",
+    "copy.lock": "Lock",
+    "copy.unlock": "Unlock",
+    "field.typeLOCKUNLOCKOrREVOKESESSIONSFollowedByASpaceAndTheSelectedCount": "Type LOCK, UNLOCK or REVOKE-SESSIONS followed by a space and the selected count",
+    "copy.selectAccountsInTheTableAllSelectedAccountsMustBePermittedOtherwiseNoneAreChanged": "Select accounts in the table. All selected accounts must be permitted; otherwise none are changed.",
+    "copy.applyBulkAction": "Apply bulk action",
+    "copy.accountsEmailAddressesMasked": "Accounts (email addresses masked)",
+    "copy.select": "Select",
+    "copy.actions": "Actions",
+    "copy.roleDefinitionsAreReadOnlyHere": "Role definitions are read-only here.",
+    "action.revokeAllSessions": "Revoke all sessions",
+    "field.fromUTC20260101T0000Z": "From UTC (2026-01-01T00:00Z)",
+    "field.toUTC20260102T0000Z": "To UTC (2026-01-02T00:00Z)",
+    "copy.filterAudit": "Filter audit",
+    "copy.recentSecurityEvents": "Recent security events",
+    "copy.time": "Time",
+    "copy.action": "Action",
+    "copy.actor": "Actor",
+    "copy.subject": "Subject",
+    "error.aReasonIsRequired": "A reason is required",
+    "error.confirmYourIdentityBeforeThisAction": "Confirm your identity before this action",
+    "error.invalidBulkAction": "Invalid bulk action",
+    "error.typedConfirmationMustMatchTheActionAndSelectedCount": "Typed confirmation must match the action and selected count",
+    "page.bulkUpdateCompleted": "Bulk update completed",
+    "error.setupDeliveryUnavailable": "Setup delivery unavailable",
+    "error.invalidCaseAction": "Invalid case action",
+    "error.impersonationNotificationIsRequired": "Impersonation notification is required",
+    "error.invitationDeliveryUnavailable": "Invitation delivery unavailable",
+    "error.invalidStatus": "Invalid status",
     "field.currentPassword": "Current password",
     "field.currentPasswordOptional": "Current password (if configured)",
     "field.displayName": "Display name",
@@ -163,15 +337,21 @@ function themeCss(theme: ThemeVariables = {}): string {
     }).sort().join(';');
 }
 function copyCatalogue(input: Catalogue): Catalogue {
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length > 256)
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length > 512)
         throw new Error('Catalogue exceeds key limit');
     const output: Catalogue = Object.create(null) as Catalogue;
     let bytes = 0;
-    const message = (value: unknown): string => { if (typeof value !== 'string' || value.length > 2048 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value))
-        throw new Error('Invalid catalogue message'); bytes += new TextEncoder().encode(value).length; if (bytes > 65536)
-        throw new Error('Catalogue exceeds byte limit'); for (const match of value.matchAll(/\{([^{}]*)\}/g))
-        if (!/^[a-zA-Z][a-zA-Z0-9_]{0,31}$/.test(match[1]!))
-            throw new Error('Invalid catalogue placeholder'); return value; };
+    const message = (value: unknown): string => {
+        if (typeof value !== 'string' || value.length > 2048 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value))
+            throw new Error('Invalid catalogue message');
+        bytes += new TextEncoder().encode(value).length;
+        if (bytes > 65536)
+            throw new Error('Catalogue exceeds byte limit');
+        for (const match of value.matchAll(/\{([^{}]*)\}/g))
+            if (!/^[a-zA-Z][a-zA-Z0-9_]{0,31}$/.test(match[1]!))
+                throw new Error('Invalid catalogue placeholder');
+        return value;
+    };
     for (const [key, value] of Object.entries(input)) {
         if (!/^[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+$/.test(key) || key.length > 128)
             throw new Error('Invalid catalogue key');
@@ -243,8 +423,12 @@ export function createPresentation(options: PresentationOptions = {}): Presentat
             }
             locale ??= defaultLocale;
             const selected = locale, info = new Intl.Locale(selected).maximize(), dir: 'rtl' | 'ltr' = info.script ? rtlScripts.has(info.script) ? 'rtl' : 'ltr' : rtlLanguages.has(info.language) ? 'rtl' : 'ltr', plural = new Intl.PluralRules(selected), numbers = new Intl.NumberFormat(selected), catalogue = catalogues.get(selected)!;
-            return Object.freeze({ locale: selected, lang: selected, dir, cssVariables, ...(logo ? { logo } : {}), ...(favicon ? { favicon } : {}), textSource(sourceEnglish: string): string { if (typeof sourceEnglish !== 'string' || sourceEnglish.length > 2048)
-                    throw new Error('Invalid source text'); const key = englishKeys.get(sourceEnglish); return key ? this.text(key) : sourceEnglish; }, text(key: string, values: Readonly<Record<string, string | number>> = {}): string {
+            return Object.freeze({ locale: selected, lang: selected, dir, cssVariables, ...(logo ? { logo } : {}), ...(favicon ? { favicon } : {}), textSource(sourceEnglish: string): string {
+                    if (typeof sourceEnglish !== 'string' || sourceEnglish.length > 2048)
+                        throw new Error('Invalid source text');
+                    const key = englishKeys.get(sourceEnglish);
+                    return key ? this.text(key) : sourceEnglish;
+                }, text(key: string, values: Readonly<Record<string, string | number>> = {}): string {
                     if (!Object.hasOwn(catalogue, key))
                         throw new Error('Unknown catalogue key');
                     if (!values || typeof values !== 'object' || Array.isArray(values) || Object.keys(values).length > 16)
@@ -261,8 +445,12 @@ export function createPresentation(options: PresentationOptions = {}): Presentat
                             throw new Error('Plural message requires a numeric count');
                         template = entry[plural.select(values.count)] ?? entry.other;
                     }
-                    const output = template.replace(/\{([a-zA-Z][a-zA-Z0-9_]{0,31})\}/g, (_whole, name: string) => { if (!Object.hasOwn(values, name))
-                        throw new Error('Missing catalogue value'); const value = values[name]!; return typeof value === 'number' ? numbers.format(value) : value; });
+                    const output = template.replace(/\{([a-zA-Z][a-zA-Z0-9_]{0,31})\}/g, (_whole, name: string) => {
+                        if (!Object.hasOwn(values, name))
+                            throw new Error('Missing catalogue value');
+                        const value = values[name]!;
+                        return typeof value === 'number' ? numbers.format(value) : value;
+                    });
                     if (output.length > 8192)
                         throw new Error('Catalogue output exceeds limit');
                     return output;

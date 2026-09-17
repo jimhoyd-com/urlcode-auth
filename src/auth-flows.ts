@@ -1,3 +1,5 @@
+import { createPresentation } from './presentation.ts';
+import type { PresentationContext } from './presentation.ts';
 import type { Presentation } from './presentation.ts';
 import type { RegistrationInput } from './registration.ts';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -19,11 +21,12 @@ export interface AuthFlowOptions {
     passkeys?: PasskeyProvider;
     enrollment?: {
         required: boolean;
-        fields: () => string;
+        fields: (presentation?: PresentationContext) => string;
         read: (fields: Record<string, string>) => RegistrationInput;
         names: string[];
     };
 }
+const defaultPresentation = createPresentation();
 const id = () => randomBytes(32).toString('base64url');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function record(value: unknown): Record<string, unknown> {
@@ -62,9 +65,10 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
     ] => ['set-cookie', `${flowCookie}=${value}; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=${maxAge}`];
     const finish = async (request: ExtensionRequest, result: AuthSessionResult): Promise<AuthHttpResponse> => { const headers = options.onSession ? await options.onSession(request, result) : []; return wantsJson(request) ? jsonResponse(200, { user: result.user, csrf: http.token(result.token), ...(result.principal.restrictions ? { restrictions: result.principal.restrictions } : {}) }, [...http.sessionHeaders(result.token), cookie('', 0), ...headers]) : jsonResponse(303, { redirect: mount + '/account' }, [['location', mount + '/account'], ...http.sessionHeaders(result.token), cookie('', 0), ...headers]); };
     return {
-        buttons(csrf: string, link = false, text: (value: string) => string = value => value): string { return Object.keys(providers).map(name => `<form method="post" action="${escapeHtml(mount + '/providers/' + name + (link ? '/link' : '/start'))}">${csrfField(csrf)}<button type="submit">${escapeHtml(text(link ? 'Link' : 'Sign in with'))} ${escapeHtml(name)}</button></form>`).join(''); },
+        buttons(csrf: string, link = false, text: (value: string) => string = value => value, locale?: string, presentation?: PresentationContext): string { return Object.keys(providers).map(name => `<form method="post" action="${escapeHtml(mount + '/providers/' + name + (link ? '/link' : '/start') + (locale ? '?lang=' + encodeURIComponent(locale) : ''))}">${csrfField(csrf)}<button type="submit">${escapeHtml((presentation ?? defaultPresentation.resolve()).text(link ? 'provider.link' : 'provider.signIn', { provider: name }))}</button></form>`).join(''); },
         async handle(request: ExtensionRequest): Promise<AuthHttpResponse | undefined> {
-            const presentation = options.presentation?.resolve({ ...(request.query.get('lang') ? { queryLocale: request.query.get('lang')! } : {}), ...(request.headers.get('accept-language') ? { acceptLanguage: request.headers.get('accept-language')! } : {}) });
+            let presentation = (options.presentation ?? defaultPresentation).resolve({ ...(request.query.get('lang') ? { queryLocale: request.query.get('lang')! } : {}), ...(request.headers.get('accept-language') ? { acceptLanguage: request.headers.get('accept-language')! } : {}) });
+            const tr = (key: string, values?: Readonly<Record<string, string | number>>) => escapeHtml(presentation.text(key, values));
             const pageResponse = (...args: Parameters<typeof renderPage>) => renderPage(...[args[0], args[1], args[2], args[3], args[4], presentation] as Parameters<typeof renderPage>);
             const formField = (name: string, label: string, type = 'text', autocomplete = 'off', required = true) => baseField(name, presentation?.textSource(label) ?? label, type, autocomplete, required);
             const path = request.path.slice(mount.length), match = /^\/providers\/([a-z][a-z0-9-]{0,31})\/(start|link|callback)$/.exec(path);
@@ -88,7 +92,7 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                     const started = await provider.start(), browser = id(), destination = new URL(started.url);
                     if (destination.protocol !== 'https:' || destination.username || destination.password)
                         throw new AuthHttpError(502, 'Invalid provider response');
-                    await service.putFlow({ id: started.flow.state, kind: 'oidc', expires: Date.now() + 600000, data: { name, flow: started.flow, browserHash: hash(browser), ...(actorToken ? { actorToken } : {}) } });
+                    await service.putFlow({ id: started.flow.state, kind: 'oidc', expires: Date.now() + 600000, data: { name, locale: presentation.locale, flow: started.flow, browserHash: hash(browser), ...(actorToken ? { actorToken } : {}) } });
                     return jsonResponse(303, { redirect: destination.href }, [['location', destination.href], cookie(browser)]);
                 }
                 if (!['GET', 'POST'].includes(request.method))
@@ -102,6 +106,8 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                 if (states.length !== 1 || states[0]!.length > 256)
                     throw new AuthHttpError(400, 'Invalid provider state');
                 const data = record(await service.consumeFlow(states[0]!, 'oidc'));
+                if (typeof data.locale === 'string')
+                    presentation = (options.presentation ?? defaultPresentation).resolve({ queryLocale: data.locale });
                 checkBinding(data, http.cookie(request, flowCookie));
                 if (data.name !== name)
                     throw new AuthHttpError(400, 'Provider flow mismatch');
@@ -121,14 +127,16 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                     return jsonResponse(303, { linked: true }, [['location', mount + '/account'], cookie('', 0), ...http.sessionHeaders(data.actorToken)]);
                 }
                 let externalProof = await service.getExternalProof(identityProvider, identity.subject), user = externalProof?.user;
+                if (user?.profile?.locale)
+                    presentation = (options.presentation ?? defaultPresentation).resolve({ accountLocale: user.profile.locale, queryLocale: presentation.locale });
                 if (!user) {
                     if (!registration || !identity.email || !identity.emailVerified)
                         throw new AuthHttpError(403, 'An existing linked account is required');
                     if (options.enrollment?.required) {
                         const enrollment = id();
-                        await service.putFlow({ id: enrollment, kind: 'oidc-enrollment', expires: Date.now() + 600000, data: { email: identity.email, provider: identityProvider, subject: identity.subject, browserHash: data.browserHash } });
+                        await service.putFlow({ id: enrollment, kind: 'oidc-enrollment', expires: Date.now() + 600000, data: { email: identity.email, provider: identityProvider, subject: identity.subject, browserHash: data.browserHash, locale: presentation.locale } });
                         const browser = http.prepare(request);
-                        return pageResponse('Complete your account', `<form method="post" action="${escapeHtml(mount + '/providers/enroll')}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(enrollment)}">${options.enrollment.fields()}<button type="submit">Create account</button></form>`, 200, browser.headers);
+                        return pageResponse('Complete your account', `<form method="post" action="${escapeHtml(mount + '/providers/enroll?lang=' + encodeURIComponent(presentation.locale))}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(enrollment)}">${options.enrollment.fields(presentation)}<button type="submit">${tr("action.register")}</button></form>`, 200, browser.headers);
                     }
                     user = await service.createExternalAccount({ email: identity.email, emailVerified: true, provider: identityProvider, subject: identity.subject });
                     externalProof = await service.getExternalProof(identityProvider, identity.subject);
@@ -137,9 +145,9 @@ export function createAuthFlows(options: AuthFlowOptions, http: AuthHttp, mount:
                     throw new AuthHttpError(401, 'Identity changed during sign in');
                 if (user.totpEnabled) {
                     const pending = id();
-                    await service.putFlow({ id: pending, kind: 'oidc-mfa', expires: Date.now() + 300000, data: { accountId: user.id, proof: externalProof.proof, browserHash: data.browserHash } });
+                    await service.putFlow({ id: pending, kind: 'oidc-mfa', expires: Date.now() + 300000, data: { accountId: user.id, proof: externalProof.proof, browserHash: data.browserHash, locale: presentation.locale } });
                     const browser = http.prepare(request);
-                    return pageResponse('Confirm second factor', `<form method="post" action="${escapeHtml(mount + '/providers/complete')}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(pending)}">${formField('totp', 'Authenticator code', 'text', 'one-time-code', false)}${formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false)}<button type="submit">Complete sign in</button></form>`, 200, browser.headers);
+                    return pageResponse('Confirm second factor', `<form method="post" action="${escapeHtml(mount + '/providers/complete?lang=' + encodeURIComponent(presentation.locale))}">${csrfField(browser.csrf)}<input type="hidden" name="flowId" value="${escapeHtml(pending)}">${formField('totp', 'Authenticator code', 'text', 'one-time-code', false)}${formField('recoveryCode', 'Recovery code (instead of authenticator code)', 'text', 'off', false)}<button type="submit">${tr("action.completeSignIn")}</button></form>`, 200, browser.headers);
                 }
                 return finish(request, await service.issueSession(user.id, { device: http.device(request), method: 'oidc', proof: externalProof.proof }));
             }

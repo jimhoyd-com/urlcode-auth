@@ -36,6 +36,7 @@ try {
     roles: {member: [], admin: ['*']},
     defaultRole: 'member',
     registrationMode: 'off',
+    ...(process.env.AUTH_CONFIG_FROM ? {approveConfigurationChangeFrom: process.env.AUTH_CONFIG_FROM} : {}),
   });
 } finally { key.fill(0); }
 export default service;
@@ -89,7 +90,7 @@ npx urlcode-auth bootstrap --operator-file "$PWD/operator-service.mjs"
 npx urlcode serve --project "$PWD/app" --host-file "$PWD/host.mjs" --origin "$AUTH_ORIGIN"
 \`\`\`
 
-Sign in at /account/login; /private requires a valid session. Opening registration requires changing the YAML, reviewing it, and setting a new explicit revision pin. Email recovery is unavailable until an operator sender is configured. Do not serve hostile frontend scripts on this origin: browser JavaScript shares ambient session authority even though guest server code cannot read session headers.
+Sign in at /account/login; /private requires a valid session. Opening registration requires a reviewed operator configuration migration as well as changing the YAML and setting a new explicit project revision pin. Inspect the current database configuration with the configuration CLI command, then supply its exact hash as AUTH_CONFIG_FROM for the first startup with the new operator settings. This revokes old sessions and pending sign-ins. Stop/restart all service instances; old workers refuse requests after migration. Remove the approval environment variable after the migration. Email recovery is unavailable until an operator sender is configured. Do not serve hostile frontend scripts on this origin: browser JavaScript shares ambient session authority even though guest server code cannot read session headers.
 
 Back up the SQLite database through the auth backup API, not by copying a live WAL database. Preserve encryption.key and csrf.key separately in your secret backup system, together with the exact operator configuration. Database backup does not include those key files. A restored snapshot can restore historical sessions and tokens: use a planned revocation and recovery procedure. Generated files and key material are local, not published.
 `;
@@ -99,13 +100,16 @@ export async function initAuthentication(directory: string): Promise<Authenticat
         throw new Error('An output directory is required');
     const requested = resolve(directory), parent = await realpath(dirname(requested)), root = join(parent, basename(requested));
     await mkdir(root, { mode: 0o700 });
-    async function write(path: string, value: string | Uint8Array): Promise<void> { const file = await open(join(root, path), 'wx', 0o600); try {
-        await file.writeFile(value);
-        await file.sync();
+    async function write(path: string, value: string | Uint8Array): Promise<void> {
+        const file = await open(join(root, path), 'wx', 0o600);
+        try {
+            await file.writeFile(value);
+            await file.sync();
+        }
+        finally {
+            await file.close();
+        }
     }
-    finally {
-        await file.close();
-    } }
     try {
         await mkdir(join(root, 'app'), { mode: 0o700 });
         await mkdir(join(root, 'data'), { mode: 0o700 });
