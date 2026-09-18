@@ -122,7 +122,7 @@ async function probe(root: string): Promise<AuthBaselineResult> {
         add('enrollment.restricted-authority-withheld', restricted.principal.roles.length === 0 && restricted.principal.permissions.length === 0 && restricted.principal.restrictions?.includes('verify-email') === true && restricted.principal.restrictions.includes('enroll-mfa'));
         add('enrollment.protected-route-denied', (await request('/protected')).status === 403);
         add('enrollment.account-page-available', (await request('/account/account')).status === 200);
-    } catch { add('baseline.probes-completed', false); }
+    } catch (e) { console.error('DIAGNOSTIC:', e && e.constructor && e.constructor.name, JSON.stringify(e && e.code), String(e && e.message)); add('baseline.probes-completed', false); }
     finally {
         try { await runtime?.close(); } catch { add('cleanup.runtime-closed', false); }
         try { await service?.close(); } catch { add('cleanup.service-closed', false); }
