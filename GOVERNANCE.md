@@ -4,8 +4,9 @@ URLCode auth (@jimhoyd/urlcode-auth) is the optional, operator-installed authent
 Apache-2.0 project that follows the governance of the core URLCode repository
 ([jimhoyd-com/urlcode/GOVERNANCE.md](https://github.com/jimhoyd-com/urlcode/blob/main/GOVERNANCE.md));
 this file records how that governance applies here. @jimhoyd maintains the
-repository. The package is private/unpublished while integration with core is
-reviewed; the documented contract describes implemented behavior, not planned work.
+repository. The package is published to npm as alphas while integration with
+core is reviewed; the documented contract describes implemented behavior, not
+planned work.
 
 ## Changes and responsibility
 
@@ -32,9 +33,10 @@ workflows run, and only GitHub-owned actions are allowed by repository policy.
 Keep sensitive reports in the private security channel.
 
 Only current reviewed main receives fixes; there is no LTS/backport guarantee or
-release SLA. The package is not published to npm: consumers build it from a
-reviewed exact commit (see [CONTRIBUTING.md](CONTRIBUTING.md)). Pin exact
-commits to identify patches. Independent assessment and deployment exercises
+release SLA. The package is published to npm as alphas; reviewed-source builds
+from an exact commit remain the alternative (see
+[CONTRIBUTING.md](CONTRIBUTING.md)). Pin exact versions or commits to identify
+patches. Independent assessment and deployment exercises
 remain required before claiming hostile multi-tenant or deployment-specific
 readiness.
 
