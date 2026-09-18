@@ -46,8 +46,10 @@ test('real HTTP signup verifies before credentials, resumes safely and commits p
  const credentialHtml=await (await request('/signup',undefined,undefined,true)).text();
  assert.match(credentialHtml,/<h1[^>]*>Secure your account<\/h1>/);
  assert.match(credentialHtml,/reader@example.test/);
- assert.match(credentialHtml,/aria-current="step"/);
- assert.match(credentialHtml,/Use at least 15 characters/);
+ assert.match(credentialHtml,/Step 3 of 4/);
+ assert.match(credentialHtml,/<(?:main|body)[^>]*data-layout="compact"/);
+ assert.doesNotMatch(credentialHtml,/<ol class="ui-steps"/);
+ assert.match(credentialHtml,/At least 15 characters/);
  assert.match(credentialHtml,/aria-describedby="password-[a-f0-9]+-description"/);
  assert.match(credentialHtml,/<button class="ui-button-secondary">Start again<\/button>/);
  assert.ok(credentialHtml.includes('/account/login?lang=en'));
