@@ -18,10 +18,7 @@ test('peers.json is the single source of verified peer revisions', async () => {
 
 test('check-sqlite.mjs agrees with patched() in src/auth-store.ts', async () => {
   const { patchedSqlite } = await import(pathToFileURL(new URL('scripts/check-sqlite.mjs', root).pathname).href) as { patchedSqlite: (v: string) => boolean };
-  const source = await readFile(new URL('src/auth-store.ts', root), 'utf8');
-  const line = source.split('\n').find((l) => l.startsWith('function patched('));
-  assert.ok(line, 'patched() must exist in src/auth-store.ts');
-  const patched = new Function(`${line!.replace(/\(version: string\): boolean/, '(version)')}; return patched;`)() as (v: string) => boolean;
+  const { patched } = await import('../src/auth-store.ts');
   const matrix: Array<[string, boolean]> = [
     ['3.44.5', false], ['3.44.6', true], ['3.44.7', true],
     ['3.45.0', false], ['3.49.9', false],
