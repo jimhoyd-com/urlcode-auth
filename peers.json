@@ -1,5 +1,5 @@
 {
   "$comment": "Single source of the verified peer revisions for this repository. CI (.github/workflows/verify.yml) checks these commits out, scripts/pack-sources.mjs defaults --core-revision to the urlcode value, and ACCEPTANCE.md links here. Update this file when a new peer revision has been reviewed; do not pin SHAs elsewhere.",
   "urlcode": "50790d3a2aa7bb75f3ae67f068c17d43511cfed9",
-  "urlcode-ui": "906f21fafbbc001c869ff008979f98ca33114f50"
+  "urlcode-ui": "06dd3aeb12b29303ef553ef8077d2b4f6a1fe077"
 }
