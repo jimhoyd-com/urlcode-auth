@@ -98,8 +98,8 @@ test('kit-rendered pages escape user-controlled values, bind one nonce to the ex
     assert.doesNotMatch(csp, /unsafe-inline/);
     assert.equal(page.headers.get('cache-control'), 'no-store');
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
-    assert.match(html, /<link rel="stylesheet" href="\/assets\/ui\/kit\.[0-9a-f]{12}\.css">/);
-    const stylesheet = await request(/href="(\/assets\/ui\/kit\.[0-9a-f]{12}\.css)"/.exec(html)![1]!);
+    assert.match(html, /<link rel="stylesheet" href="\/assets\/ui\/static\/kit\.[0-9a-f]{12}\.css">/);
+    const stylesheet = await request(/href="(\/assets\/ui\/static\/kit\.[0-9a-f]{12}\.css)"/.exec(html)![1]!);
     assert.equal(stylesheet.status, 200);
     assert.match(stylesheet.headers.get('etag') ?? '', /^"[0-9a-f]+"$/);
     const failure = await request('/account/verify?token=a&token=b', { html: true });

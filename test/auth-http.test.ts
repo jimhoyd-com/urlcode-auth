@@ -93,7 +93,7 @@ test('trusted UI is no-store with restrictive CSP and never exposes a session to
     const scriptNonces = [...html.matchAll(/<script nonce="([^"]+)"/g)].map(match => match[1]);
     const styleNonce = /<style nonce="([^"]+)">/.exec(html)?.[1];
     if (render === 'primitives') assert.equal(scriptNonces.length, 1, 'Only the reviewed theme bootstrap runs on identifier entry');
-    else { assert.equal(scriptNonces.length, 0, 'The kit adds no script to identifier entry'); assert.match(html, /<link rel="stylesheet" href="\/assets\/ui\/kit\.[0-9a-f]{12}\.css">/); }
+    else { assert.equal(scriptNonces.length, 0, 'The kit adds no script to identifier entry'); assert.match(html, /<link rel="stylesheet" href="\/assets\/ui\/static\/kit\.[0-9a-f]{12}\.css">/); }
     assert.ok(page.headers.get('content-security-policy')!.includes(`script-src 'nonce-${scriptNonces[0] ?? styleNonce}'`));
     assert.doesNotMatch(page.headers.get('content-security-policy')!, /script-src[^;]*'unsafe-inline'/);
     assert.doesNotMatch(html, /<script[^>]+src=/);
