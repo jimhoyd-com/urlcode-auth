@@ -10,7 +10,7 @@ These packages are private and not published to npm. A registry `@jimhoyd/urlcod
 
 Use a current supported Node release with a patched SQLite build. The service checks SQLite patch versions and refuses affected builds even if the package's minimum Node version is satisfied.
 
-Each repository has a lockfile. The source packaging helper installs dependencies with lifecycle scripts disabled, builds the reviewed packages, installs local peer tarballs in dependency order and writes package integrity/revision metadata. It does not publish. All source trees must be committed and clean. Replace these illustrative paths and the SHA with your reviewed locations and commit:
+Each repository has a lockfile. The source packaging helper installs dependencies with lifecycle scripts disabled, builds the reviewed packages, installs local peer tarballs in dependency order and writes package integrity/revision metadata. It does not publish. All source trees must be committed and clean. Replace these illustrative paths with your reviewed locations. `--core-revision` defaults to the `urlcode` entry in [`peers.json`](peers.json), the single source of verified peer revisions; pass it explicitly only to override:
 
 ```sh
 node scripts/pack-sources.mjs \
